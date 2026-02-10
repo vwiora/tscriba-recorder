@@ -12,7 +12,8 @@ import time
 from typing import Optional, Callable
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox
+import customtkinter as ctk
 # Optional tray/menu bar controls (Windows tray / macOS menu bar)
 try:
     import pystray  # type: ignore
@@ -343,7 +344,11 @@ class TrayController:
         t.start()
 
     def stop(self):
-        pass
+        try:
+            if self.icon is not None:
+                self.icon.stop()
+        except Exception:
+            pass
 
 class FasterWhisperMicTranscriber:
     """
@@ -811,11 +816,12 @@ class FasterWhisperMicTranscriber:
                     self.text_cb(candidate_add + "\n")
 
 
-class TscribaRecorderApp(tk.Tk):
+class TscribaRecorderApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
         # ---- Window basics ----
+        ctk.set_appearance_mode("System")
         self.title("Tscriba Recorder")
         self.geometry("860x420")
 
@@ -873,97 +879,107 @@ class TscribaRecorderApp(tk.Tk):
         self._build_device_cache()
 
         # ---- UI ----
-        frm = ttk.Frame(self, padding=12)
-        frm.pack(fill="both", expand=True)
+        frm = ctk.CTkFrame(self)
+        frm.pack(fill="both", expand=True, padx=12, pady=12)
         # Aufnahme-Quelle(n)
-        r0 = ttk.Frame(frm)
+        r0 = ctk.CTkFrame(frm)
         r0.pack(fill="x", pady=(0, 8))
-        ttk.Label(r0, text="Aufnahme:").pack(side="left")
+        ctk.CTkLabel(r0, text="Aufnahme:").pack(side="left")
 
         self.rec_mic_var = tk.BooleanVar(value=True)
         self.rec_sys_var = tk.BooleanVar(value=False)
 
-        self.rec_mic_chk = ttk.Checkbutton(
+        self.rec_mic_chk = ctk.CTkCheckBox(
             r0, text="Mikrofon aufnehmen", variable=self.rec_mic_var, command=self.on_mode_change
         )
         self.rec_mic_chk.pack(side="left", padx=(8, 0))
 
-        self.rec_sys_chk = ttk.Checkbutton(
+        self.rec_sys_chk = ctk.CTkCheckBox(
             r0, text="Systemaudio aufnehmen", variable=self.rec_sys_var, command=self.on_mode_change
         )
         self.rec_sys_chk.pack(side="left", padx=(12, 0))
 
         # Mic device
-        r1 = ttk.LabelFrame(frm, text="Mikrofon")
+        r1 = ctk.CTkFrame(frm)
         r1.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(r1, text="Mikrofon").pack(anchor="w", padx=8, pady=(6, 0))
         self.mic_var = tk.StringVar(value="Default Input")
-        self.mic_cb = ttk.Combobox(r1, textvariable=self.mic_var, state="readonly", width=80)
-        self.mic_cb.pack(side="left", padx=8, pady=8, fill="x", expand=True)
-        self.mic_cb.bind("<<ComboboxSelected>>", lambda e: self.on_device_change())
+        self.mic_cb = ctk.CTkComboBox(
+            r1,
+            variable=self.mic_var,
+            values=[],
+            command=lambda _val: self.on_device_change(),
+        )
+        self.mic_cb.pack(side="left", padx=8, pady=(6, 8), fill="x", expand=True)
         # Systemaudio (UI only – capture via ScreenCaptureKit will be implemented later)
-        r2 = ttk.LabelFrame(frm, text="Systemaudio")
+        r2 = ctk.CTkFrame(frm)
         r2.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(r2, text="Systemaudio").pack(anchor="w", padx=8, pady=(6, 0))
         self.sys_var = tk.StringVar(value="ScreenCaptureKit (keine Auswahl)")
-        self.sys_label = ttk.Label(r2, textvariable=self.sys_var)
-        self.sys_label.pack(side="left", padx=8, pady=8, fill="x", expand=True)
+        self.sys_label = ctk.CTkLabel(r2, textvariable=self.sys_var)
+        self.sys_label.pack(side="left", padx=8, pady=(6, 8), fill="x", expand=True)
 
         # Settings
-        r3 = ttk.Frame(frm)
+        r3 = ctk.CTkFrame(frm)
         r3.pack(fill="x", pady=(0, 8))
 
-        ttk.Label(r3, text="Sample rate:").pack(side="left")
+        ctk.CTkLabel(r3, text="Sample rate:").pack(side="left")
         self.sr_var = tk.IntVar(value=48000)
-        ttk.Spinbox(r3, from_=8000, to=192000, textvariable=self.sr_var, width=10).pack(
+        tk.Spinbox(r3, from_=8000, to=192000, textvariable=self.sr_var, width=10).pack(
             side="left", padx=(6, 14)
         )
 
-        ttk.Label(r3, text="Channels:").pack(side="left")
+        ctk.CTkLabel(r3, text="Channels:").pack(side="left")
         self.ch_var = tk.IntVar(value=1)
-        self.ch_spin = ttk.Spinbox(r3, from_=1, to=2, textvariable=self.ch_var, width=5)
+        self.ch_spin = tk.Spinbox(r3, from_=1, to=2, textvariable=self.ch_var, width=5)
         self.ch_spin.pack(side="left", padx=(6, 0))
 
-        ttk.Button(r3, text="Refresh Devices", command=self.refresh_devices).pack(side="right")
+        ctk.CTkButton(r3, text="Refresh Devices", command=self.refresh_devices).pack(side="right")
 
 
         # Gain (dB)
-        r3b = ttk.Frame(frm)
+        r3b = ctk.CTkFrame(frm)
         r3b.pack(fill="x", pady=(0, 8))
 
-        ttk.Label(r3b, text="Mic gain (dB):").pack(side="left")
+        ctk.CTkLabel(r3b, text="Mic gain (dB):").pack(side="left")
         self.mic_gain_var = tk.DoubleVar(value=0.0)
-        self.mic_gain_spin = ttk.Spinbox(r3b, from_=-24, to=24, increment=1, textvariable=self.mic_gain_var, width=6)
+        self.mic_gain_spin = tk.Spinbox(
+            r3b, from_=-24, to=24, increment=1, textvariable=self.mic_gain_var, width=6
+        )
         self.mic_gain_spin.pack(side="left", padx=(6, 14))
 
-        ttk.Label(r3b, text="System gain (dB):").pack(side="left")
+        ctk.CTkLabel(r3b, text="System gain (dB):").pack(side="left")
         self.sys_gain_var = tk.DoubleVar(value=9.0)
-        self.sys_gain_spin = ttk.Spinbox(r3b, from_=-24, to=24, increment=1, textvariable=self.sys_gain_var, width=6)
+        self.sys_gain_spin = tk.Spinbox(
+            r3b, from_=-24, to=24, increment=1, textvariable=self.sys_gain_var, width=6
+        )
         self.sys_gain_spin.pack(side="left", padx=(6, 0))
 
         # Output
-        r4 = ttk.Frame(frm)
+        r4 = ctk.CTkFrame(frm)
         r4.pack(fill="x", pady=(0, 8))
-        ttk.Label(r4, text="Output file:").pack(side="left")
+        ctk.CTkLabel(r4, text="Output file:").pack(side="left")
         self.out_var = tk.StringVar(value=default_out_path())
-        ttk.Entry(r4, textvariable=self.out_var).pack(side="left", padx=8, fill="x", expand=True)
-        ttk.Button(r4, text="Browse…", command=self.browse_out).pack(side="left")
-        ttk.Button(r4, text="Ordner öffnen", command=self.open_recordings_folder).pack(
+        ctk.CTkEntry(r4, textvariable=self.out_var).pack(side="left", padx=8, fill="x", expand=True)
+        ctk.CTkButton(r4, text="Browse…", command=self.browse_out).pack(side="left")
+        ctk.CTkButton(r4, text="Ordner öffnen", command=self.open_recordings_folder).pack(
             side="left", padx=(8, 0)
         )
 
         # Controls
-        r5 = ttk.Frame(frm)
+        r5 = ctk.CTkFrame(frm)
         r5.pack(fill="x", pady=(0, 8))
-        self.btn_record = ttk.Button(r5, text="Record", command=self.start_recording)
+        self.btn_record = ctk.CTkButton(r5, text="Record", command=self.start_recording)
         self.btn_record.pack(side="left")
-        self.btn_pause = ttk.Button(r5, text="Pause", command=self.toggle_pause, state="disabled")
+        self.btn_pause = ctk.CTkButton(r5, text="Pause", command=self.toggle_pause, state="disabled")
         self.btn_pause.pack(side="left", padx=8)
-        self.btn_stop = ttk.Button(r5, text="Stop", command=self.stop_recording, state="disabled")
+        self.btn_stop = ctk.CTkButton(r5, text="Stop", command=self.stop_recording, state="disabled")
         self.btn_stop.pack(side="left")
 
         # Live transcription (UI only for now)
-        r5b = ttk.Frame(frm)
+        r5b = ctk.CTkFrame(frm)
         r5b.pack(fill="x", pady=(0, 8))
-        ttk.Checkbutton(
+        ctk.CTkCheckBox(
             r5b,
             text="Live-Transkription",
             variable=self.live_transcription_var,
@@ -971,82 +987,78 @@ class TscribaRecorderApp(tk.Tk):
         ).pack(side="left")
 
         # Language selector for live transcription (Auto / Deutsch / English)
-        ttk.Label(r5b, text="Sprache:").pack(side="left", padx=(10, 6))
-        ttk.OptionMenu(
+        ctk.CTkLabel(r5b, text="Sprache:").pack(side="left", padx=(10, 6))
+        ctk.CTkOptionMenu(
             r5b,
-            self.transcription_language_var,
-            "Auto",
-            "Auto",
-            "Deutsch",
-            "English",
+            variable=self.transcription_language_var,
+            values=["Auto", "Deutsch", "English"],
         ).pack(side="left")
 
-        ttk.Button(
+        ctk.CTkButton(
             r5b,
             text="Transcript…",
             command=self.open_transcript_window,
         ).pack(side="left", padx=(10, 0))
 
         # Live transcription tuning row (below checkbox)
-        r5c = ttk.Frame(frm)
+        r5c = ctk.CTkFrame(frm)
         r5c.pack(fill="x", pady=(0, 8))
 
-        ttk.Label(r5c, text="Chunk (s):").pack(side="left")
-        ttk.Spinbox(
+        ctk.CTkLabel(r5c, text="Chunk (s):").pack(side="left")
+        tk.Spinbox(
             r5c, from_=0.5, to=15.0, increment=0.1,
             textvariable=self.transcription_chunk_seconds_var, width=6
         ).pack(side="left", padx=(6, 12))
 
-        ttk.Label(r5c, text="Overlap (s):").pack(side="left")
-        ttk.Spinbox(
+        ctk.CTkLabel(r5c, text="Overlap (s):").pack(side="left")
+        tk.Spinbox(
             r5c, from_=0.0, to=10.0, increment=0.1,
             textvariable=self.transcription_overlap_seconds_var, width=6
         ).pack(side="left", padx=(6, 12))
 
-        ttk.Label(r5c, text="Beam:").pack(side="left")
-        ttk.Spinbox(
+        ctk.CTkLabel(r5c, text="Beam:").pack(side="left")
+        tk.Spinbox(
             r5c, from_=1, to=10, increment=1,
             textvariable=self.transcription_beam_size_var, width=4
         ).pack(side="left", padx=(6, 12))
 
-        ttk.Checkbutton(
+        ctk.CTkCheckBox(
             r5c,
             text="VAD",
             variable=self.transcription_vad_filter_var,
         ).pack(side="left")
-        ttk.Label(r5c, text="Model:").pack(side="left", padx=(10, 6))
-        ttk.OptionMenu(
+        ctk.CTkLabel(r5c, text="Model:").pack(side="left", padx=(10, 6))
+        ctk.CTkOptionMenu(
             r5c,
-            self.transcription_model_size_var,
-            self.transcription_model_size_var.get() or "small",
-            "small",
-            "medium",
-            "large",
+            variable=self.transcription_model_size_var,
+            values=["small", "medium", "large"],
         ).pack(side="left")
         # Level (separat: Mic / System)
-        r6 = ttk.Frame(frm)
+        r6 = ctk.CTkFrame(frm)
         r6.pack(fill="x", pady=(8, 0))
 
-        r6a = ttk.Frame(r6)
+        r6a = ctk.CTkFrame(r6)
         r6a.pack(fill="x")
-        ttk.Label(r6a, text="Mic:").pack(side="left")
-        self.level_mic = ttk.Progressbar(r6a, orient="horizontal", length=520, mode="determinate", maximum=100)
+        ctk.CTkLabel(r6a, text="Mic:").pack(side="left")
+        self.level_mic = ctk.CTkProgressBar(r6a, width=520)
+        self.level_mic.set(0)
         self.level_mic.pack(side="left", padx=8, fill="x", expand=True)
 
-        r6b = ttk.Frame(r6)
+        r6b = ctk.CTkFrame(r6)
         r6b.pack(fill="x", pady=(4, 0))
-        ttk.Label(r6b, text="System:").pack(side="left")
-        self.level_sys = ttk.Progressbar(r6b, orient="horizontal", length=520, mode="determinate", maximum=100)
+        ctk.CTkLabel(r6b, text="System:").pack(side="left")
+        self.level_sys = ctk.CTkProgressBar(r6b, width=520)
+        self.level_sys.set(0)
         self.level_sys.pack(side="left", padx=8, fill="x", expand=True)
 
         # Status / hint
         self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(frm, textvariable=self.status_var, wraplength=820).pack(fill="x", pady=(10, 0))
+        ctk.CTkLabel(frm, textvariable=self.status_var, wraplength=820).pack(fill="x", pady=(10, 0))
 
         # Shortcut to open transcript window
         # macOS Command key
         self.hint_var = tk.StringVar(value="")
-        ttk.Label(frm, textvariable=self.hint_var, wraplength=820).pack(fill="x", pady=(6, 0))
+        ctk.CTkLabel(frm, textvariable=self.hint_var, wraplength=820).pack(fill="x", pady=(6, 0))
 
         # Init
         self.refresh_devices()
@@ -1126,9 +1138,10 @@ class TscribaRecorderApp(tk.Tk):
             self.input_devices,
             key=lambda d: (0 if d["label"] == "Default Input" else 1, d["label"].lower()),
         )
-        self.mic_cb["values"] = [d["label"] for d in mic_list]
-        if self.mic_var.get() not in self.mic_cb["values"]:
-            self.mic_cb.current(0)
+        values = [d["label"] for d in mic_list]
+        self.mic_cb.configure(values=values)
+        if self.mic_var.get() not in values and values:
+            self.mic_var.set(values[0])
         # Systemaudio: no input device selection in UI (ScreenCaptureKit comes later)
         self.sys_var.set("ScreenCaptureKit (keine Auswahl)")
 
@@ -1196,31 +1209,31 @@ class TscribaRecorderApp(tk.Tk):
         sys_enabled = bool(self.rec_sys_var.get())
 
         # Enable/disable mic controls
-        self.mic_cb.config(state="readonly" if mic_enabled else "disabled")
-        self.mic_gain_spin.config(state="normal" if mic_enabled else "disabled")
+        self.mic_cb.configure(state="normal" if mic_enabled else "disabled")
+        self.mic_gain_spin.configure(state="normal" if mic_enabled else "disabled")
 
         # Systemaudio: UI only (no device selection)
         # We just enable/disable the gain control to reflect the choice.
-        self.sys_gain_spin.config(state="normal" if sys_enabled else "disabled")
+        self.sys_gain_spin.configure(state="normal" if sys_enabled else "disabled")
 
         # Channels behavior: if both sources selected, force 2ch mixdown mode in UI (like before)
         if mode == "both":
             self.ch_var.set(2)
-            self.ch_spin.config(state="disabled")
+            self.ch_spin.configure(state="disabled")
 
         # Lock transcript window close while recording
         if self._transcript_win is not None:
             self._update_transcript_close_state()
         else:
-            self.ch_spin.config(state="normal")
+            self.ch_spin.configure(state="normal")
 
         # Prevent recording if nothing is selected
         if (not mic_enabled) and (not sys_enabled):
-            self.btn_record.config(state="disabled")
+            self.btn_record.configure(state="disabled")
             self.hint_var.set("Bitte mindestens eine Quelle auswählen (Mikrofon und/oder Systemaudio).")
         else:
             if not self.rec.is_running:
-                self.btn_record.config(state="normal")
+                self.btn_record.configure(state="normal")
 
         # One-time hint: macOS requires the "Screen & System Audio Recording" permission for system audio
         # via ScreenCaptureKit (even though we do NOT record any video).
@@ -1258,7 +1271,7 @@ class TscribaRecorderApp(tk.Tk):
             entry = self._find_entry(self.mic_var.get())
             max_in = int(entry.get("max_in", 1) or 1)
             max_allowed = max(1, min(2, max_in))
-            self.ch_spin.config(to=max_allowed)
+            self.ch_spin.configure(to=max_allowed)
 
             if self.ch_var.get() > max_allowed:
                 self.ch_var.set(max_allowed)
@@ -1382,11 +1395,11 @@ class TscribaRecorderApp(tk.Tk):
                     pass
                 messagebox.showerror("Recording error", str(e))
                 # restore UI state
-                self.btn_record.config(state="normal")
-                self.btn_pause.config(state="disabled", text="Pause")
-                self.btn_stop.config(state="disabled")
-                self.rec_mic_chk.config(state="normal")
-                self.rec_sys_chk.config(state="normal")
+                self.btn_record.configure(state="normal")
+                self.btn_pause.configure(state="disabled", text="Pause")
+                self.btn_stop.configure(state="disabled")
+                self.rec_mic_chk.configure(state="normal")
+                self.rec_sys_chk.configure(state="normal")
                 self.on_mode_change()
                 return
         else:
@@ -1414,17 +1427,17 @@ class TscribaRecorderApp(tk.Tk):
                     pass
 
         # lock UI during recording (mic and/or system)
-        self.btn_record.config(state="disabled")
+        self.btn_record.configure(state="disabled")
         # Pause only supported for mic (for now)
         if mic_enabled:
-            self.btn_pause.config(state="normal", text="Pause")
+            self.btn_pause.configure(state="normal", text="Pause")
         else:
-            self.btn_pause.config(state="disabled", text="Pause")
-        self.btn_stop.config(state="normal")
-        self.rec_mic_chk.config(state="disabled")
-        self.rec_sys_chk.config(state="disabled")
-        self.mic_cb.config(state="disabled")
-        self.ch_spin.config(state="disabled")
+            self.btn_pause.configure(state="disabled", text="Pause")
+        self.btn_stop.configure(state="normal")
+        self.rec_mic_chk.configure(state="disabled")
+        self.rec_sys_chk.configure(state="disabled")
+        self.mic_cb.configure(state="disabled")
+        self.ch_spin.configure(state="disabled")
 
     def toggle_pause(self):
         # Pause/Resume is currently only implemented for mic recording.
@@ -1432,10 +1445,10 @@ class TscribaRecorderApp(tk.Tk):
             return
         if self.rec.is_paused:
             self.rec.resume()
-            self.btn_pause.config(text="Pause")
+            self.btn_pause.configure(text="Pause")
         else:
             self.rec.pause()
-            self.btn_pause.config(text="Resume")
+            self.btn_pause.configure(text="Resume")
 
     def stop_recording(self):
         if (not self.rec.is_running) and (not self._sys_only_running) and (self.sys_helper is None or not self.sys_helper.is_running):
@@ -1475,11 +1488,11 @@ class TscribaRecorderApp(tk.Tk):
 
         self._sys_only_running = False
 
-        self.btn_record.config(state="normal")
-        self.btn_pause.config(state="disabled", text="Pause")
-        self.btn_stop.config(state="disabled")
-        self.rec_mic_chk.config(state="normal")
-        self.rec_sys_chk.config(state="normal")
+        self.btn_record.configure(state="normal")
+        self.btn_pause.configure(state="disabled", text="Pause")
+        self.btn_stop.configure(state="disabled")
+        self.rec_mic_chk.configure(state="normal")
+        self.rec_sys_chk.configure(state="normal")
         self.on_mode_change()
 
         # Tell the user where the files were written (consistent names).
@@ -1644,11 +1657,11 @@ class TscribaRecorderApp(tk.Tk):
         sys_val = int(max(0.0, min(1.0, (self._sys_level_db + 60.0) / 60.0)) * 100)
 
         try:
-            self.level_mic["value"] = mic_val
+            self.level_mic.set(mic_val / 100.0)
         except Exception:
             pass
         try:
-            self.level_sys["value"] = sys_val
+            self.level_sys.set(sys_val / 100.0)
         except Exception:
             pass
 
@@ -2122,16 +2135,16 @@ class TscribaRecorderApp(tk.Tk):
                 self._transcript_win = None
         self._transcript_text = None
 
-        win = tk.Toplevel(self)
+        win = ctk.CTkToplevel(self)
         win.title("Tscriba Recorder – Live Transcript")
         win.geometry("720x500")
         win.protocol("WM_DELETE_WINDOW", self._close_transcript_window)
         self._transcript_win = win
 
-        top = ttk.Frame(win, padding=10)
-        top.pack(fill="both", expand=True)
+        top = ctk.CTkFrame(win)
+        top.pack(fill="both", expand=True, padx=10, pady=10)
 
-        hdr = ttk.Label(
+        hdr = ctk.CTkLabel(
             top,
             text="Live-Transkription – faster-whisper.\n"
                  "Aktiviere die Checkbox im Hauptfenster und starte eine Aufnahme (Mic und/oder System).",
@@ -2139,22 +2152,22 @@ class TscribaRecorderApp(tk.Tk):
         )
         hdr.pack(anchor="w", pady=(0, 10))
 
-        txt = tk.Text(top, wrap="word", height=15)
+        txt = ctk.CTkTextbox(top, wrap="word")
         txt.insert("1.0", "")
         txt.configure(state="disabled")
         txt.pack(fill="both", expand=True)
         self._transcript_text = txt
 
-        footer = ttk.Frame(top)
+        footer = ctk.CTkFrame(top)
         footer.pack(fill="x", pady=(10, 0))
 
         enabled = "AN" if self.live_transcription_var.get() else "AUS"
         self._transcript_status_var = tk.StringVar(value=f"Live-Transkription: {enabled}")
-        ttk.Label(footer, textvariable=self._transcript_status_var).pack(side="left")
+        ctk.CTkLabel(footer, textvariable=self._transcript_status_var).pack(side="left")
 
         # Language display (relevant when UI is set to Auto)
         self._transcript_lang_var = tk.StringVar(value="Sprache: Auto")
-        ttk.Label(footer, textvariable=self._transcript_lang_var).pack(side="left", padx=(12, 0))
+        ctk.CTkLabel(footer, textvariable=self._transcript_lang_var).pack(side="left", padx=(12, 0))
 
                 # initialize with current selection / detection
         try:
@@ -2162,9 +2175,9 @@ class TscribaRecorderApp(tk.Tk):
         except Exception:
             pass
 
-        self._transcript_close_btn = ttk.Button(footer, text="Schließen", command=self._close_transcript_window)
+        self._transcript_close_btn = ctk.CTkButton(footer, text="Schließen", command=self._close_transcript_window)
         self._transcript_close_btn.pack(side="right")
-        ttk.Button(footer, text="Save", command=self._save_transcript_txt).pack(side="right", padx=(0, 8))
+        ctk.CTkButton(footer, text="Save", command=self._save_transcript_txt).pack(side="right", padx=(0, 8))
 
         # Disable transcript window close controls while recording (also during pause)
         self._update_transcript_close_state()
