@@ -1,0 +1,14 @@
+{
+  "sample_rate": 48000,
+  "channels": 2,
+  "mic_gain_db": 0.0,
+  "system_gain_db": 9.0,
+  "live_transcription": true,
+  "language": "Auto",
+  "chunk_seconds": 2.5,
+  "overlap_seconds": 0.7,
+  "beam_size": 3,
+  "vad_filter": true,
+  "model_size": "small",
+  "recordings_root": "/Users/volkerwiora/Documents/Tscriba Recorder Recordings"
+}

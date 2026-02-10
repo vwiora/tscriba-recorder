@@ -5,7 +5,14 @@ set -euo pipefail
 # Tscriba Recorder Build Script (Python 3.12 pinned + native helper + permissions)
 # -----------------------------------------------------------------------------
 
-PYTHON_BIN="${PYTHON_BIN:-python3.12}"
+TRANSCRIBER_PY="/Users/volkerwiora/Projects/Transcriba Transcription Manager/.venv/bin/python"
+if [ -x "$TRANSCRIBER_PY" ]; then
+  DEFAULT_PY="$TRANSCRIBER_PY"
+else
+  DEFAULT_PY="python3.12"
+fi
+
+PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PY}"
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "ERROR: $PYTHON_BIN not found."
@@ -19,8 +26,8 @@ echo "Using Python: $($PYTHON_BIN -V)"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
 
-APP_NAME="Tscriba Recorder"
-BUNDLE_ID="com.local.tscriba_recorder"
+APP_NAME="Transcriba Recorder"
+BUNDLE_ID="com.local.transcriba.recorder"
 REQ_FILE="requirements.txt"
 VENV_DIR=".venv"
 
@@ -81,6 +88,8 @@ pyinstaller \
   --windowed \
   --name "$APP_NAME" \
   --osx-bundle-identifier "$BUNDLE_ID" \
+  --add-data "transcriba_theme.json:." \
+  --add-data "assets:assets" \
   --collect-binaries ctranslate2 \
   --collect-binaries tokenizers \
   --collect-submodules ctranslate2 \
@@ -93,6 +102,8 @@ pyinstaller \
   --collect-submodules objc \
   --collect-submodules Foundation \
   --collect-submodules AppKit \
+  --collect-submodules webrtc_audio_processing \
+  --collect-binaries webrtc_audio_processing \
   tscriba_recorder_app.py
 
 # -----------------------------------------------------------------------------

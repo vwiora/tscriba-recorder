@@ -4,7 +4,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-PYTHON_BIN="${PYTHON_BIN:-python3.12}"
+TRANSCRIBER_PY="/Users/volkerwiora/Projects/Transcriba Transcription Manager/.venv/bin/python"
+if [ -x "$TRANSCRIBER_PY" ]; then
+  DEFAULT_PY="$TRANSCRIBER_PY"
+else
+  DEFAULT_PY="python3.12"
+fi
+
+PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PY}"
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "ERROR: $PYTHON_BIN not found."

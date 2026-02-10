@@ -156,6 +156,9 @@ class AudioRecorder:
         # optional tap: forward mic chunks to another consumer (e.g., live transcription)
         # signature: cb(chunk: np.ndarray, samplerate: int) -> None
         self._mic_tap = None
+        # optional processor: transform mic chunks before gain/write
+        # signature: cb(chunk: np.ndarray, samplerate: int) -> np.ndarray
+        self._mic_processor = None
 
     @property
     def is_running(self) -> bool:
@@ -173,6 +176,14 @@ class AudioRecorder:
         It must be fast and non-blocking.
         """
         self._mic_tap = cb
+
+    def set_mic_processor(self, cb):
+        """Set/clear mic processing callback.
+
+        The callback (if set) is called from the sounddevice callback thread.
+        It must be fast and non-blocking.
+        """
+        self._mic_processor = cb
 
     def start(self, out_path: str, mode: Mode, cfg: RecorderConfig):
         if self._running:
@@ -264,6 +275,12 @@ class AudioRecorder:
                 if self._stop_evt.is_set() or self._pause_evt.is_set():
                     return
                 chunk = indata.copy()
+                proc = getattr(self, '_mic_processor', None)
+                if proc is not None:
+                    try:
+                        chunk = proc(chunk, int(stream_sr))
+                    except Exception:
+                        pass
                 tap = getattr(self, '_mic_tap', None)
                 if tap is not None:
                     try:
@@ -303,6 +320,12 @@ class AudioRecorder:
                 if self._stop_evt.is_set() or self._pause_evt.is_set():
                     return
                 chunk = indata.copy()
+                proc = getattr(self, '_mic_processor', None)
+                if proc is not None:
+                    try:
+                        chunk = proc(chunk, int(stream_sr))
+                    except Exception:
+                        pass
                 tap = getattr(self, '_mic_tap', None)
                 if tap is not None:
                     try:
@@ -478,6 +501,20 @@ class AudioRecorder:
         self._mode = None
         if self._on_status:
             self._on_status("Stopped")
+
+    def set_mic_gain_db(self, db: float):
+        """Update mic gain while running."""
+        try:
+            self._mic_gain = _db_to_lin(db or 0.0)
+        except Exception:
+            pass
+
+    def set_sys_gain_db(self, db: float):
+        """Update system gain while running."""
+        try:
+            self._sys_gain = _db_to_lin(db or 0.0)
+        except Exception:
+            pass
 
 
 # Preferred aliases

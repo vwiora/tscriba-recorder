@@ -8,3 +8,4 @@ pystray
 Pillow
 pyobjc-framework-Cocoa
 customtkinter
+webrtc-audio-processing
