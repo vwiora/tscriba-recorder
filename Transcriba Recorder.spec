@@ -52,6 +52,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['assets/transcriba.icns'],
 )
 coll = COLLECT(
     exe,
@@ -65,6 +66,6 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='Transcriba Recorder.app',
-    icon=None,
+    icon='assets/transcriba.icns',
     bundle_identifier='com.local.transcriba.recorder',
 )

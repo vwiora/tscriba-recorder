@@ -463,6 +463,8 @@ class AudioRecorder:
             return
 
         self._stop_evt.set()
+        # Ensure paused state is cleared so UI state checks don't keep reporting "paused" after stop.
+        self._pause_evt.clear()
 
         # stop streams
         for s in (self._stream_mic, self._stream_sys):

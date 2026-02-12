@@ -15,6 +15,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 import numpy as np  # type: ignore
+import sounddevice as sd  # type: ignore
 # Optional tray/menu bar controls (Windows tray / macOS menu bar)
 try:
     import pystray  # type: ignore
@@ -276,11 +277,12 @@ class SystemAudioHelper:
     converts to int16 WAV for compatibility.
     """
 
-    def __init__(self, wav_path: str, sample_rate: int = 48000, status_cb=None, level_cb=None):
+    def __init__(self, wav_path: Optional[str], sample_rate: int = 48000, status_cb=None, level_cb=None, no_write: bool = False):
         self.wav_path = wav_path
         self.sample_rate = int(sample_rate)
         self._status_cb = status_cb
         self._level_cb = level_cb
+        self.no_write = bool(no_write)
         self._proc = None
         self._stop_evt = threading.Event()
         self._thread = None
@@ -300,10 +302,11 @@ class SystemAudioHelper:
         if not helper.exists():
             raise FileNotFoundError(f"Systemaudio helper not found: {helper}")
 
-        # Ensure output directory exists
-        out_dir = os.path.dirname(self.wav_path)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
+        # Ensure output directory exists (recording mode).
+        if (not self.no_write) and self.wav_path:
+            out_dir = os.path.dirname(self.wav_path)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
 
         self._stop_evt.clear()
         self._proc = subprocess.Popen(
@@ -379,6 +382,41 @@ class SystemAudioHelper:
     def _reader_loop(self):
         p = self._proc
         if p is None or p.stdout is None:
+            return
+
+        # Test mode: read/process levels/taps, but do not write WAV files.
+        if self.no_write:
+            try:
+                while not self._stop_evt.is_set():
+                    h = p.stdout.read(_HDR.size)
+                    if not h or len(h) != _HDR.size:
+                        break
+                    nframes, nch, fmt, nbytes = _HDR.unpack(h)
+                    payload = p.stdout.read(nbytes)
+                    if len(payload) != nbytes:
+                        break
+                    if fmt != 1:
+                        self._emit_status(f"Systemaudio: unexpected format code {fmt}")
+                        break
+                    if self._audio_tap is not None:
+                        try:
+                            a = np.frombuffer(payload, dtype=np.float32)
+                            if a.size == int(nframes) * int(nch):
+                                a = a.reshape(int(nframes), int(nch))
+                                self._audio_tap(a, int(self.sample_rate), int(nch))
+                        except Exception:
+                            pass
+                    if self._level_cb is not None:
+                        try:
+                            floats = np.frombuffer(payload, dtype=np.float32)
+                            if floats.size > 0:
+                                rms = float(np.sqrt(np.mean(np.square(floats))))
+                                db = 20.0 * np.log10(max(rms, 1e-12))
+                                self._level_cb(db)
+                        except Exception:
+                            pass
+            except Exception as e:
+                self._emit_status(f"Systemaudio: reader error: {e}")
             return
 
         try:
@@ -525,13 +563,21 @@ class _EchoCanceller:
             return np.repeat(out_mono[:, None], chunk.shape[1], axis=1)
         return out_mono
 
-def _create_tray_image():
-    # Simple red dot icon; replace later with a real PNG if you want.
+def _create_tray_image(recording: bool = False, phase: int = 0):
+    # Simple status icon:
+    # - idle: gray dot
+    # - recording: pulsing red ring + red center
     if not TRAY_AVAILABLE:
         return None
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.ellipse((12, 12, 52, 52), fill=(220, 0, 0, 255))
+    if recording:
+        ring = (255, 80, 80, 220) if (phase % 2 == 0) else (255, 80, 80, 120)
+        center = (220, 0, 0, 255) if (phase % 2 == 0) else (220, 0, 0, 210)
+        d.ellipse((8, 8, 56, 56), fill=ring)
+        d.ellipse((16, 16, 48, 48), fill=center)
+    else:
+        d.ellipse((12, 12, 52, 52), fill=(130, 130, 130, 255))
     return img
 
 
@@ -543,6 +589,9 @@ class TrayController:
     def __init__(self, ipc_write_fd: int):
         self._wfd = ipc_write_fd
         self.icon = None
+        self._last_title = None
+        self._last_recording_state = None
+        self._last_recording_phase = None
 
         if not TRAY_AVAILABLE:
             return
@@ -555,7 +604,7 @@ class TrayController:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self._cmd("Q")),
         )
-        self.icon = pystray.Icon("Tscriba Recorder", _create_tray_image(), "Tscriba Recorder", menu)
+        self.icon = pystray.Icon("Tscriba Recorder", _create_tray_image(recording=False), "Tscriba Recorder", menu)
 
     def _cmd(self, ch: str):
         def _handler(icon=None, item=None):
@@ -588,6 +637,32 @@ class TrayController:
         try:
             if self.icon is not None:
                 self.icon.stop()
+        except Exception:
+            pass
+
+    def set_title(self, title: str):
+        try:
+            if self.icon is None:
+                return
+            t = str(title or "").strip()
+            if not t:
+                return
+            if t == self._last_title:
+                return
+            self.icon.title = t
+            self._last_title = t
+        except Exception:
+            pass
+
+    def set_recording_effect(self, active: bool, phase: int = 0):
+        try:
+            if self.icon is None:
+                return
+            if self._last_recording_state == bool(active) and self._last_recording_phase == int(phase):
+                return
+            self.icon.icon = _create_tray_image(recording=bool(active), phase=int(phase))
+            self._last_recording_state = bool(active)
+            self._last_recording_phase = int(phase)
         except Exception:
             pass
 
@@ -1080,6 +1155,14 @@ class TscribaRecorderApp(ctk.CTk):
         self._sys_level_db = -120.0
         self._echo_active = False
         self._mic_gain_db_base = 0.0
+        self._record_elapsed_total = 0.0
+        self._record_started_at = None
+        self._record_timer_var = tk.StringVar(value="00:00:00")
+        self._last_tray_timer_text = None
+        self._last_tray_recording_effect = None
+        self._test_running = False
+        self._test_mic_stream = None
+        self._test_sys_helper = None
 
         # --- Live transcription UI (Mic only: faster-whisper, Schritt 1) ---
         self.live_transcription_var = tk.BooleanVar(value=False)
@@ -1092,6 +1175,7 @@ class TscribaRecorderApp(ctk.CTk):
         self.transcription_model_size_var = tk.StringVar(value="small")
         self.appearance_mode = tk.StringVar(value="System")
         self.recordings_root_var = tk.StringVar(value=default_recordings_dir())
+        self.auto_small_on_recording_var = tk.BooleanVar(value=False)
         self.auto_duck_var = tk.BooleanVar(value=False)
         self.auto_duck_strength_var = tk.DoubleVar(value=18.0)
         self.aec_enabled_var = tk.BooleanVar(value=True)
@@ -1246,6 +1330,7 @@ class TscribaRecorderApp(ctk.CTk):
             self.auto_duck_strength_var.set(float(data.get("auto_duck_strength_db", self.auto_duck_strength_var.get() or 18.0)))
             self.aec_enabled_var.set(bool(data.get("aec_enabled", self.aec_enabled_var.get())))
             self.recordings_root_var.set(str(data.get("recordings_root", self.recordings_root_var.get() or default_recordings_dir())))
+            self.auto_small_on_recording_var.set(bool(data.get("auto_small_on_recording", self.auto_small_on_recording_var.get())))
             try:
                 global RECORDINGS_ROOT_OVERRIDE
                 RECORDINGS_ROOT_OVERRIDE = self.recordings_root_var.get()
@@ -1284,6 +1369,7 @@ class TscribaRecorderApp(ctk.CTk):
             "auto_duck_strength_db": float(self.auto_duck_strength_var.get() or 18.0),
             "aec_enabled": bool(self.aec_enabled_var.get()),
             "recordings_root": str(self.recordings_root_var.get() or ""),
+            "auto_small_on_recording": bool(self.auto_small_on_recording_var.get()),
         }
         try:
             self.sr_var.set(int(sr))
@@ -1325,10 +1411,13 @@ class TscribaRecorderApp(ctk.CTk):
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
 
-        sidebar = ctk.CTkFrame(self, width=230, corner_radius=0, fg_color=SIDEBAR_BG)
+        self._sidebar_width = 230
+        sidebar = ctk.CTkFrame(self, width=self._sidebar_width, corner_radius=0, fg_color=SIDEBAR_BG)
         sidebar.grid(row=0, column=0, sticky="nsw")
-        sidebar.grid_rowconfigure(91, weight=1)
+        sidebar.grid_propagate(False)
+        sidebar.grid_rowconfigure(90, weight=1)
         sidebar.grid_columnconfigure(0, weight=1)
+        self.sidebar = sidebar
 
         logo_container = ctk.CTkFrame(sidebar, fg_color=SIDEBAR_BG, height=75)
         logo_container.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
@@ -1393,7 +1482,71 @@ class TscribaRecorderApp(ctk.CTk):
                 self._tab_button_defaults[name] = {"fg_color": None, "text_color": None}
             row += 1
 
-        ctk.CTkFrame(sidebar, fg_color=SIDEBAR_BG).grid(row=91, column=0, sticky="nsew")
+        self.compact_panel = ctk.CTkFrame(sidebar, fg_color=SIDEBAR_BG, corner_radius=8)
+        self.compact_panel.grid(row=90, column=0, sticky="nsew", padx=PAD, pady=(PAD, 0))
+        self.compact_panel.grid_remove()
+        self.compact_panel.grid_columnconfigure(0, weight=1)
+        self.compact_panel.grid_rowconfigure(2, weight=1)
+
+        compact_btn_row = ctk.CTkFrame(self.compact_panel, fg_color="transparent", corner_radius=0)
+        compact_btn_row.grid(row=0, column=0, sticky="ew")
+        compact_btn_row.grid_columnconfigure((0, 1, 2), weight=1)
+
+        compact_h = max(28, CONTROL_HEIGHT - 8)
+        compact_font = _font(max(12, FONT_BASE - 2))
+        self.btn_record_compact = ctk.CTkButton(
+            compact_btn_row, text="Play", command=self.start_recording, font=compact_font, height=compact_h
+        )
+        _style_button(self.btn_record_compact)
+        self.btn_record_compact.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        self.btn_pause_compact = ctk.CTkButton(
+            compact_btn_row, text="Pause", command=self.toggle_pause, font=compact_font, height=compact_h
+        )
+        _style_button(self.btn_pause_compact)
+        self.btn_pause_compact.grid(row=0, column=1, sticky="ew", padx=2)
+
+        self.btn_stop_compact = ctk.CTkButton(
+            compact_btn_row, text="Stop", command=self.stop_recording, font=compact_font, height=compact_h
+        )
+        _style_button(self.btn_stop_compact)
+        self.btn_stop_compact.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+
+        compact_levels = ctk.CTkFrame(self.compact_panel, fg_color="transparent", corner_radius=0)
+        compact_levels.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        compact_levels.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(compact_levels, text="Mic", font=_font(FONT_BASE)).grid(row=0, column=0, sticky="w")
+        self.level_mic_compact = ctk.CTkProgressBar(compact_levels)
+        self.level_mic_compact.set(0)
+        self.level_mic_compact.grid(row=1, column=0, sticky="ew")
+        ctk.CTkLabel(compact_levels, text="System", font=_font(FONT_BASE)).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.level_sys_compact = ctk.CTkProgressBar(compact_levels)
+        self.level_sys_compact.set(0)
+        self.level_sys_compact.grid(row=3, column=0, sticky="ew")
+
+        self._compact_transcript_text = ctk.CTkTextbox(self.compact_panel, wrap="word", font=_font(FONT_BASE))
+        _style_textbox(self._compact_transcript_text)
+        self._compact_transcript_text.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+        self._compact_transcript_text.configure(state="disabled")
+        _style_textbox_readonly(self._compact_transcript_text)
+
+        self._compact_controls = {
+            "record": self.btn_record_compact,
+            "pause": self.btn_pause_compact,
+            "stop": self.btn_stop_compact,
+        }
+
+        self._compact_view = False
+        self._full_geometry_before_compact = None
+        self.btn_toggle_view = ctk.CTkButton(
+            sidebar,
+            text="Kleine Ansicht",
+            width=180,
+            font=_font(size=FONT_BASE),
+            command=self._toggle_compact_view,
+        )
+        _style_button(self.btn_toggle_view)
+        self.btn_toggle_view.grid(row=95, column=0, sticky="ew", padx=PAD, pady=(PAD, 0))
 
         self.btn_toggle_log = ctk.CTkButton(
             sidebar,
@@ -1479,6 +1632,7 @@ class TscribaRecorderApp(ctk.CTk):
         self.on_mode_change()
 
         self.after(0, self._ensure_log_width)
+        self.after(0, self._sync_main_layout)
 
     def _spin_set_state(self, spin, state):
         try:
@@ -1712,6 +1866,11 @@ class TscribaRecorderApp(ctk.CTk):
         r5.pack(fill="x", pady=(16, 0))
         r5c = ctk.CTkFrame(r5, fg_color="transparent", corner_radius=0)
         r5c.pack(anchor="center")
+        self.btn_test = ctk.CTkButton(
+            r5c, text="Start Test", command=self.toggle_test_mode, font=_font(FONT_BASE), height=CONTROL_HEIGHT
+        )
+        _style_button(self.btn_test)
+        self.btn_test.pack(side="left", padx=(0, 8))
         self.btn_record = ctk.CTkButton(
             r5c, text="Record", command=self.start_recording, font=_font(FONT_BASE), height=CONTROL_HEIGHT
         )
@@ -1727,6 +1886,7 @@ class TscribaRecorderApp(ctk.CTk):
         )
         _style_button(self.btn_stop)
         self.btn_stop.pack(side="left")
+        ctk.CTkLabel(r5, textvariable=self._record_timer_var, font=_font(FONT_BASE)).pack(anchor="center", pady=(6, 0))
 
         r6 = ctk.CTkFrame(frm, fg_color="transparent", corner_radius=0)
         self.levels_frame = r6
@@ -1842,14 +2002,6 @@ class TscribaRecorderApp(ctk.CTk):
         )
         self.aec_chk.pack(anchor="w")
 
-        r3f = ctk.CTkFrame(sec1, fg_color="transparent", corner_radius=0)
-        r3f.pack(fill="x", padx=8, pady=(0, 8))
-        ctk.CTkLabel(r3f, text="Auto-duck strength (dB)", font=_font(FONT_BASE)).pack(anchor="w")
-        self.auto_duck_strength_spin = self._make_spinbox(
-            r3f, self.auto_duck_strength_var, 6.0, 30.0, increment=1.0, width=70, expand=True
-        )
-        self.auto_duck_strength_spin.pack(fill="x", pady=(4, 0))
-
         r3g = ctk.CTkFrame(sec1, fg_color="transparent", corner_radius=0)
         r3g.pack(fill="x", padx=8, pady=(0, 8))
         ctk.CTkLabel(r3g, text="Auto-duck preset", font=_font(FONT_BASE)).pack(anchor="w")
@@ -1861,6 +2013,10 @@ class TscribaRecorderApp(ctk.CTk):
             command=self._on_auto_duck_preset,
         )
         _style_entry(self.auto_duck_preset)
+        try:
+            self.auto_duck_preset.set(self._auto_duck_preset_label())
+        except Exception:
+            pass
         self.auto_duck_preset.pack(fill="x", pady=(4, 0))
 
         ctk.CTkLabel(body, text="Transcription Settings", font=_font(FONT_BASE), anchor="w").grid(
@@ -1909,6 +2065,16 @@ class TscribaRecorderApp(ctk.CTk):
         )
         _style_button(btn_root)
         btn_root.pack(side="right")
+
+        r7d = ctk.CTkFrame(sec3, fg_color="transparent", corner_radius=0)
+        r7d.pack(fill="x", padx=8, pady=(4, 8))
+        auto_small_chk = ctk.CTkCheckBox(
+            r7d,
+            text="Kleine Anzeige während Recordings einschalten",
+            variable=self.auto_small_on_recording_var,
+            font=_font(FONT_BASE),
+        )
+        auto_small_chk.pack(anchor="w")
 
         self._transcription_controls = []
 
@@ -2014,19 +2180,27 @@ class TscribaRecorderApp(ctk.CTk):
         )
         _style_button(btn_stop)
         btn_stop.pack(side="left")
+        ctk.CTkLabel(row, textvariable=self._record_timer_var, font=_font(FONT_BASE)).pack(anchor="center", pady=(6, 0))
 
         return {"record": btn_record, "pause": btn_pause, "stop": btn_stop}
 
     def _sync_record_buttons(self):
         ctrls = getattr(self, "_transcript_controls", None)
-        if not ctrls:
+        targets = []
+        if ctrls:
+            targets.append(ctrls)
+        compact_ctrls = getattr(self, "_compact_controls", None)
+        if compact_ctrls:
+            targets.append(compact_ctrls)
+        if not targets:
             return
-        try:
-            ctrls["record"].configure(state=self.btn_record.cget("state"))
-            ctrls["stop"].configure(state=self.btn_stop.cget("state"))
-            ctrls["pause"].configure(state=self.btn_pause.cget("state"), text=self.btn_pause.cget("text"))
-        except Exception:
-            pass
+        for t in targets:
+            try:
+                t["record"].configure(state=self.btn_record.cget("state"))
+                t["stop"].configure(state=self.btn_stop.cget("state"))
+                t["pause"].configure(state=self.btn_pause.cget("state"), text=self.btn_pause.cget("text"))
+            except Exception:
+                pass
 
     def _build_log_panel(self):
         self.status_var = tk.StringVar(value="Ready.")
@@ -2184,33 +2358,195 @@ class TscribaRecorderApp(ctk.CTk):
 
     def _toggle_log_panel(self):
         if self._log_collapsed:
-            try:
-                self.main_pane.add(self.log_root, minsize=240)
-            except Exception:
-                pass
             self._log_collapsed = False
-            try:
-                self.btn_toggle_log.configure(text="Log ausblenden")
-            except Exception:
-                pass
         else:
             try:
-                self._log_last_width = self.log_root.winfo_width()
-            except Exception:
-                pass
-            try:
-                self.main_pane.forget(self.log_root)
+                w = int(self.log_root.winfo_width() or 0)
+                if w > 0:
+                    self._log_last_width = w
             except Exception:
                 pass
             self._log_collapsed = True
+        self._refresh_log_toggle_label()
+        self._sync_main_layout()
+        if bool(getattr(self, "_compact_view", False)):
+            self._apply_compact_window_size(log_visible=(not self._log_collapsed))
+
+    def _toggle_compact_view(self):
+        turning_on = not bool(getattr(self, "_compact_view", False))
+        if turning_on:
+            self._full_geometry_before_compact = self._current_window_geometry()
+        self._compact_view = turning_on
+        try:
+            self.btn_toggle_view.configure(text=("Große Anzeige" if self._compact_view else "Kleine Ansicht"))
+        except Exception:
+            pass
+        self._refresh_log_toggle_label()
+        self._sync_main_layout()
+        if self._compact_view:
+            self._apply_compact_window_size(log_visible=(not self._log_collapsed))
+        else:
+            self._restore_full_window_geometry()
+
+    def _pane_has(self, pane) -> bool:
+        try:
+            return str(pane) in set(self.main_pane.panes())
+        except Exception:
+            return False
+
+    def _set_tab_buttons_visible(self, visible: bool):
+        for btn in (self._tab_buttons or {}).values():
             try:
-                self.btn_toggle_log.configure(text="Log anzeigen")
+                if visible:
+                    btn.grid()
+                else:
+                    btn.grid_remove()
             except Exception:
                 pass
+
+    def _set_compact_panel_visible(self, visible: bool):
+        panel = getattr(self, "compact_panel", None)
+        if panel is None:
+            return
+        try:
+            if visible:
+                panel.grid()
+                self._update_compact_transcript_visibility()
+            else:
+                panel.grid_remove()
+        except Exception:
+            pass
+
+    def _update_compact_transcript_visibility(self):
+        txt = getattr(self, "_compact_transcript_text", None)
+        if txt is None:
+            return
+        show = bool(self.live_transcription_var.get())
+        try:
+            if show:
+                txt.grid()
+            else:
+                txt.grid_remove()
+        except Exception:
+            pass
+
+    def _refresh_log_toggle_label(self):
+        try:
+            self.btn_toggle_log.configure(text=("Log anzeigen" if self._log_collapsed else "Log ausblenden"))
+        except Exception:
+            pass
+
+    def _sync_main_layout(self):
+        compact = bool(getattr(self, "_compact_view", False))
+        log_hidden = bool(getattr(self, "_log_collapsed", True))
+        self._refresh_log_toggle_label()
+        self._set_tab_buttons_visible(not compact)
+        self._set_compact_panel_visible(compact)
+
+        if compact and log_hidden:
+            try:
+                self.grid_columnconfigure(1, weight=0)
+            except Exception:
+                pass
+            try:
+                self.main_pane.grid_remove()
+            except Exception:
+                pass
+            return
+
+        try:
+            self.main_pane.grid(row=0, column=1, sticky="nsew", pady=0)
+        except Exception:
+            pass
+
+        # Rebuild pane content deterministically to avoid stale splitbars/panes.
+        # Forget panes unconditionally; tk.PanedWindow can report pane lists inconsistently across transitions.
+        for pane in (self.content_root, self.log_root):
+            try:
+                self.main_pane.forget(pane)
+            except Exception:
+                pass
+
+        if compact:
+            try:
+                self.grid_columnconfigure(1, weight=1)
+            except Exception:
+                pass
+            if not log_hidden:
+                try:
+                    self.main_pane.add(self.log_root, minsize=240)
+                except Exception:
+                    pass
+        else:
+            try:
+                self.grid_columnconfigure(1, weight=1)
+            except Exception:
+                pass
+            try:
+                self.main_pane.add(self.content_root, minsize=480, padx=1)
+            except Exception:
+                pass
+            if not log_hidden:
+                try:
+                    self.main_pane.add(self.log_root, minsize=240)
+                except Exception:
+                    pass
+
+        if not log_hidden:
+            self._ensure_log_width()
+
+    def _current_window_geometry(self):
+        try:
+            self.update_idletasks()
+            return (
+                int(self.winfo_width()),
+                int(self.winfo_height()),
+                int(self.winfo_x()),
+                int(self.winfo_y()),
+            )
+        except Exception:
+            return None
+
+    def _set_window_geometry(self, w: int, h: int, x: int, y: int):
+        try:
+            self.geometry(f"{int(w)}x{int(h)}+{int(x)}+{int(y)}")
+        except Exception:
+            pass
+
+    def _compact_target_width(self, log_visible: bool) -> int:
+        sidebar_w = int(getattr(self, "_sidebar_width", 230) or 230)
+        if not log_visible:
+            return sidebar_w + 8
+        log_w = int(self._log_last_width if self._log_last_width else 400)
+        return sidebar_w + log_w + 16
+
+    def _apply_compact_window_size(self, log_visible: bool):
+        g = self._current_window_geometry()
+        if g is None:
+            return
+        _w, h, x, y = g
+        target_w = self._compact_target_width(log_visible=bool(log_visible))
+        self._set_window_geometry(target_w, h, x, y)
+
+    def _restore_full_window_geometry(self):
+        g = getattr(self, "_full_geometry_before_compact", None)
+        if g is not None:
+            w, h, x, y = g
+            self._set_window_geometry(w, h, x, y)
+        self._full_geometry_before_compact = None
 
     def _ensure_log_width(self):
         if self._log_collapsed:
             return
+        # In compact mode (log-only pane), let window resizing directly resize log.
+        try:
+            if bool(getattr(self, "_compact_view", False)) and self._pane_has(self.log_root) and (not self._pane_has(self.content_root)):
+                w = int(self.log_root.winfo_width() or 0)
+                if w > 0:
+                    self._log_last_width = w
+                return
+        except Exception:
+            pass
         try:
             w = self._log_last_width if self._log_last_width else 400
             self.main_pane.paneconfigure(self.log_root, minsize=240, width=w)
@@ -2415,10 +2751,24 @@ class TscribaRecorderApp(ctk.CTk):
         # Prevent recording if nothing is selected
         if (not mic_enabled) and (not sys_enabled):
             self.btn_record.configure(state="disabled")
+            try:
+                self.btn_test.configure(state="disabled")
+            except Exception:
+                pass
             self.hint_var.set("Bitte mindestens eine Quelle auswählen (Mikrofon und/oder Systemaudio).")
         else:
-            if not self.rec.is_running:
+            if (not self.rec.is_running) and (not self._test_running):
                 self.btn_record.configure(state="normal")
+                try:
+                    self.btn_test.configure(state="normal")
+                except Exception:
+                    pass
+            elif self._test_running:
+                self.btn_record.configure(state="disabled")
+                try:
+                    self.btn_test.configure(state="normal")
+                except Exception:
+                    pass
 
         # One-time hint: macOS requires the "Screen & System Audio Recording" permission for system audio
         # via ScreenCaptureKit (even though we do NOT record any video).
@@ -2499,11 +2849,133 @@ class TscribaRecorderApp(ctk.CTk):
         if path:
             self.out_var.set(path)
 
+    def toggle_test_mode(self):
+        if self._test_running:
+            self.stop_test_mode()
+        else:
+            self.start_test_mode()
+
+    def start_test_mode(self):
+        if self.rec.is_running or self._sys_only_running:
+            return
+
+        mic_enabled = bool(self.rec_mic_var.get())
+        sys_enabled = bool(self.rec_sys_var.get())
+        if (not mic_enabled) and (not sys_enabled):
+            return
+
+        self._level_db = -120.0
+        self._sys_level_db = -120.0
+
+        if mic_enabled:
+            try:
+                def _mic_cb(indata, frames, _time, status):
+                    if status:
+                        return
+                    if not self._test_running:
+                        return
+                    try:
+                        a = np.asarray(indata, dtype=np.float32)
+                        if a.size == 0:
+                            return
+                        rms = float(np.sqrt(np.mean(np.square(a))))
+                        self._level_db = 20.0 * np.log10(max(rms, 1e-12))
+                    except Exception:
+                        pass
+
+                self._test_mic_stream = sd.InputStream(
+                    samplerate=int(self.sr_var.get() or 48000),
+                    channels=1,
+                    dtype="float32",
+                    device=self.selected_mic_id(),
+                    callback=_mic_cb,
+                )
+                self._test_mic_stream.start()
+            except Exception as e:
+                self._test_mic_stream = None
+                messagebox.showerror("Test error", str(e))
+                return
+
+        if sys_enabled:
+            try:
+                self._test_sys_helper = SystemAudioHelper(
+                    wav_path=None,
+                    sample_rate=int(self.sr_var.get() or 48000),
+                    status_cb=lambda s: self.after(0, lambda: self.status_var.set(s)),
+                    level_cb=self.on_sys_level,
+                    no_write=True,
+                )
+                self._test_sys_helper.start()
+            except Exception as e:
+                if self._test_mic_stream is not None:
+                    try:
+                        self._test_mic_stream.stop()
+                        self._test_mic_stream.close()
+                    except Exception:
+                        pass
+                    self._test_mic_stream = None
+                messagebox.showerror("Systemaudio test error", str(e))
+                return
+
+        self._test_running = True
+        try:
+            self.btn_test.configure(text="Stop Test")
+        except Exception:
+            pass
+        self.btn_record.configure(state="disabled")
+        self.btn_pause.configure(state="disabled", text="Pause")
+        self.btn_stop.configure(state="disabled")
+        self.rec_mic_chk.configure(state="disabled")
+        self.rec_sys_chk.configure(state="disabled")
+        self._safe_set_state(self.live_transcription_chk, "disabled", "live_transcription_chk")
+        self.mic_cb.configure(state="disabled")
+        self.sys_cb.configure(state="disabled")
+        self.status_var.set("Input-Test läuft (ohne WAV-Aufnahme).")
+        self._set_levels_visible(True)
+        self._update_level_states(recording_active=True)
+        self._sync_record_buttons()
+
+    def stop_test_mode(self):
+        if not self._test_running:
+            return
+
+        if self._test_mic_stream is not None:
+            try:
+                self._test_mic_stream.stop()
+                self._test_mic_stream.close()
+            except Exception:
+                pass
+            self._test_mic_stream = None
+
+        if self._test_sys_helper is not None:
+            try:
+                self._test_sys_helper.stop()
+            except Exception:
+                pass
+            self._test_sys_helper = None
+
+        self._test_running = False
+        self._level_db = -120.0
+        self._sys_level_db = -120.0
+        try:
+            self.btn_test.configure(text="Start Test")
+        except Exception:
+            pass
+        self._safe_set_state(self.rec_mic_chk, "normal", "rec_mic_chk")
+        self._safe_set_state(self.rec_sys_chk, "normal", "rec_sys_chk")
+        self.status_var.set("Input-Test beendet.")
+        self.on_mode_change()
+        self._set_levels_visible(False)
+        self._update_level_states(recording_active=False)
+        self._sync_record_buttons()
+
     # ------------------------------------------------------------------
     # Recording
     # ------------------------------------------------------------------
 
     def start_recording(self):
+        if self._test_running:
+            return
         # Allow recording if either mic and/or system is selected.
         mic_enabled = bool(self.rec_mic_var.get())
         sys_enabled = bool(self.rec_sys_var.get())
@@ -2623,6 +3095,9 @@ class TscribaRecorderApp(ctk.CTk):
                     pass
 
         # lock UI during recording (mic and/or system)
+        self._record_elapsed_total = 0.0
+        self._record_started_at = time.monotonic()
+        self._record_timer_var.set("00:00:00")
         self.btn_record.configure(state="disabled")
         # Pause only supported for mic (for now)
         if mic_enabled:
@@ -2630,6 +3105,10 @@ class TscribaRecorderApp(ctk.CTk):
         else:
             self.btn_pause.configure(state="disabled", text="Pause")
         self.btn_stop.configure(state="normal")
+        try:
+            self.btn_test.configure(state="disabled")
+        except Exception:
+            pass
         self.rec_mic_chk.configure(state="disabled")
         self.rec_sys_chk.configure(state="disabled")
         self._safe_set_state(self.live_transcription_chk, "disabled", "live_transcription_chk")
@@ -2639,6 +3118,15 @@ class TscribaRecorderApp(ctk.CTk):
         self._set_levels_visible(True)
         self._update_level_states(recording_active=True)
         self._apply_mic_gain_db(self._mic_gain_db_base)
+        if bool(self.auto_small_on_recording_var.get()) and (not bool(getattr(self, "_compact_view", False))):
+            self._full_geometry_before_compact = self._current_window_geometry()
+            self._compact_view = True
+            try:
+                self.btn_toggle_view.configure(text="Große Anzeige")
+            except Exception:
+                pass
+            self._sync_main_layout()
+            self._apply_compact_window_size(log_visible=(not self._log_collapsed))
 
     def toggle_pause(self):
         # Pause/Resume is currently only implemented for mic recording.
@@ -2646,15 +3134,21 @@ class TscribaRecorderApp(ctk.CTk):
             return
         if self.rec.is_paused:
             self.rec.resume()
+            self._record_started_at = time.monotonic()
             self.btn_pause.configure(text="Pause")
         else:
             self.rec.pause()
+            if self._record_started_at is not None:
+                self._record_elapsed_total += max(0.0, time.monotonic() - self._record_started_at)
+            self._record_started_at = None
             self.btn_pause.configure(text="Resume")
         self._sync_record_buttons()
         self._set_levels_visible(self._is_recording_or_paused())
         self._update_level_states()
 
     def stop_recording(self):
+        if self._test_running:
+            return
         if (not self.rec.is_running) and (not self._sys_only_running) and (self.sys_helper is None or not self.sys_helper.is_running):
             return
 
@@ -2705,6 +3199,18 @@ class TscribaRecorderApp(ctk.CTk):
         self._safe_set_state(self.btn_stop, "disabled", "btn_stop")
         self._safe_set_state(self.rec_mic_chk, "normal", "rec_mic_chk")
         self._safe_set_state(self.rec_sys_chk, "normal", "rec_sys_chk")
+        if self._record_started_at is not None:
+            self._record_elapsed_total += max(0.0, time.monotonic() - self._record_started_at)
+        self._record_started_at = None
+        self._update_record_timer()
+        try:
+            if self.tray is not None:
+                self.tray.set_title("Transcriba Recorder")
+                self.tray.set_recording_effect(False, 0)
+            self._last_tray_timer_text = None
+            self._last_tray_recording_effect = None
+        except Exception:
+            pass
         self.on_mode_change()
         self._sync_record_buttons()
         self._set_levels_visible(False)
@@ -2889,10 +3395,55 @@ class TscribaRecorderApp(ctk.CTk):
             self.level_sys.set(sys_val / 100.0)
         except Exception:
             pass
+        try:
+            self.level_mic_compact.set(mic_val / 100.0)
+        except Exception:
+            pass
+        try:
+            self.level_sys_compact.set(sys_val / 100.0)
+        except Exception:
+            pass
 
+        self._update_record_timer()
         self._update_echo_state()
 
         self.after(50, self._tick_ui)
+
+    def _update_record_timer(self):
+        elapsed = float(self._record_elapsed_total)
+        if self._record_started_at is not None:
+            elapsed += max(0.0, time.monotonic() - self._record_started_at)
+        sec = int(elapsed)
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        s = sec % 60
+        timer_text = f"{h:02d}:{m:02d}:{s:02d}"
+        self._record_timer_var.set(timer_text)
+
+        # Update tray hover text while recording/paused (throttled to 1s by value change).
+        try:
+            if self._is_recording_or_paused():
+                if timer_text != self._last_tray_timer_text:
+                    if self.tray is not None:
+                        self.tray.set_title(f"Transcriba Recorder {timer_text}")
+                    self._last_tray_timer_text = timer_text
+                phase = sec % 2
+                effect_key = (True, phase)
+                if effect_key != self._last_tray_recording_effect:
+                    if self.tray is not None:
+                        self.tray.set_recording_effect(True, phase)
+                    self._last_tray_recording_effect = effect_key
+            else:
+                if self._last_tray_timer_text is not None:
+                    if self.tray is not None:
+                        self.tray.set_title("Transcriba Recorder")
+                    self._last_tray_timer_text = None
+                if self._last_tray_recording_effect is not None:
+                    if self.tray is not None:
+                        self.tray.set_recording_effect(False, 0)
+                    self._last_tray_recording_effect = None
+        except Exception:
+            pass
 
     def _update_sys_level_from_tap(self, audio: np.ndarray, sr: int, ch: int):
         try:
@@ -2973,6 +3524,11 @@ class TscribaRecorderApp(ctk.CTk):
         try:
             if self.rec.is_running:
                 self.rec.stop()
+        except Exception:
+            pass
+        try:
+            if self._test_running:
+                self.stop_test_mode()
         except Exception:
             pass
 
@@ -3085,6 +3641,7 @@ class TscribaRecorderApp(ctk.CTk):
         if (not live_tab_enabled) and getattr(self, "_current_tab", "") == "Live Transcript":
             self._select_tab("Recorder")
         self._set_transcription_settings_enabled(live_tab_enabled)
+        self._update_compact_transcript_visibility()
         self._update_transcript_status()
         # If recording is already running, start/stop transcription immediately
         try:
@@ -3186,14 +3743,24 @@ class TscribaRecorderApp(ctk.CTk):
 
         def _do():
             if self._transcript_text is None:
-                return
-            try:
-                self._transcript_text.configure(state="normal")
-                self._transcript_text.insert("end", text_line)
-                self._transcript_text.see("end")
-                self._transcript_text.configure(state="disabled")
-            except Exception:
                 pass
+            else:
+                try:
+                    self._transcript_text.configure(state="normal")
+                    self._transcript_text.insert("end", text_line)
+                    self._transcript_text.see("end")
+                    self._transcript_text.configure(state="disabled")
+                except Exception:
+                    pass
+            compact_txt = getattr(self, "_compact_transcript_text", None)
+            if compact_txt is not None:
+                try:
+                    compact_txt.configure(state="normal")
+                    compact_txt.insert("end", text_line)
+                    compact_txt.see("end")
+                    compact_txt.configure(state="disabled")
+                except Exception:
+                    pass
 
         # Tk-safe
         try:
@@ -3624,6 +4191,17 @@ class TscribaRecorderApp(ctk.CTk):
             self.auto_duck_strength_var.set(strength)
         except Exception:
             pass
+
+    def _auto_duck_preset_label(self) -> str:
+        try:
+            s = float(self.auto_duck_strength_var.get() or 18.0)
+        except Exception:
+            s = 18.0
+        if s <= 15.0:
+            return "12 dB"
+        if s <= 21.0:
+            return "18 dB"
+        return "24 dB"
 
     def _on_aec_toggle(self):
         if not self.aec_enabled_var.get():

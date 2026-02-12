@@ -82,11 +82,20 @@ swiftc -O -parse-as-library \
 # PyInstaller build
 # -----------------------------------------------------------------------------
 echo "Building app bundle with PyInstaller..."
+WEBRTC_PYINSTALLER_ARGS=()
+if python -c "import webrtc_audio_processing" >/dev/null 2>&1; then
+  echo "Including optional webrtc-audio-processing module..."
+  WEBRTC_PYINSTALLER_ARGS+=(--collect-submodules webrtc_audio_processing --collect-binaries webrtc_audio_processing)
+else
+  echo "webrtc-audio-processing unavailable; building without AEC module support."
+fi
+
 pyinstaller \
   --clean \
   --noconfirm \
   --windowed \
   --name "$APP_NAME" \
+  --icon "assets/transcriba.icns" \
   --osx-bundle-identifier "$BUNDLE_ID" \
   --add-data "transcriba_theme.json:." \
   --add-data "assets:assets" \
@@ -102,8 +111,7 @@ pyinstaller \
   --collect-submodules objc \
   --collect-submodules Foundation \
   --collect-submodules AppKit \
-  --collect-submodules webrtc_audio_processing \
-  --collect-binaries webrtc_audio_processing \
+  ${WEBRTC_PYINSTALLER_ARGS[@]+"${WEBRTC_PYINSTALLER_ARGS[@]}"} \
   tscriba_recorder_app.py
 
 # -----------------------------------------------------------------------------

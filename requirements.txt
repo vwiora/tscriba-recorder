@@ -8,4 +8,4 @@ pystray
 Pillow
 pyobjc-framework-Cocoa
 customtkinter
-webrtc-audio-processing
+webrtc-audio-processing; platform_system != "Darwin" or platform_machine != "arm64"

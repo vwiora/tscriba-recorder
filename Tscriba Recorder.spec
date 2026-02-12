@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_dynamic_libs
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+datas = [('transcriba_theme.json', '.'), ('assets', 'assets')]
 binaries = []
 hiddenimports = ['pystray._darwin']
 binaries += collect_dynamic_libs('ctranslate2')
@@ -52,6 +52,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='assets/transcriba.icns',
 )
 coll = COLLECT(
     exe,
@@ -65,6 +66,6 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='Tscriba Recorder.app',
-    icon=None,
+    icon='assets/transcriba.icns',
     bundle_identifier='com.local.tscriba_recorder',
 )
