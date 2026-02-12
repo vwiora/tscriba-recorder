@@ -147,6 +147,7 @@ xattr -cr "dist/${APP_NAME}.app" || true
 # -----------------------------------------------------------------------------
 echo "Codesigning (ad-hoc)..."
 codesign --force --sign - --timestamp=none \
+  --identifier "${BUNDLE_ID}.system_audio_capture" \
   "dist/${APP_NAME}.app/Contents/Helpers/system_audio_capture" || true
 
 codesign --force --deep --sign - --timestamp=none \

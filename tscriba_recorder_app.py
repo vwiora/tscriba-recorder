@@ -60,6 +60,21 @@ def _theme_path():
         pass
     return os.path.join(os.path.dirname(__file__), "transcriba_theme.json")
 
+
+def _runtime_state_dir():
+    """Writable runtime state directory (never inside the app bundle)."""
+    try:
+        if sys.platform == "darwin":
+            base = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Transcriba")
+        elif os.name == "nt":
+            base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Transcriba")
+        else:
+            base = os.path.join(os.path.expanduser("~"), ".config", "Transcriba")
+        os.makedirs(base, exist_ok=True)
+        return base
+    except Exception:
+        return os.path.expanduser("~")
+
 # CustomTkinter theme setup (shared with Transcriba Transcription Manager)
 ctk.set_appearance_mode("System")
 _THEME_PATH = _theme_path()
@@ -68,7 +83,7 @@ if os.path.exists(_THEME_PATH):
 try:
     _ws = ctk.get_widget_scaling()
     _wns = ctk.get_window_scaling()
-    with open(os.path.join(os.path.dirname(__file__), "ctk_scaling.txt"), "w", encoding="utf-8") as _f:
+    with open(os.path.join(_runtime_state_dir(), "ctk_scaling.txt"), "w", encoding="utf-8") as _f:
         _f.write(f"widget_scaling={_ws}\nwindow_scaling={_wns}\n")
 except Exception:
     pass
@@ -1538,6 +1553,12 @@ class TscribaRecorderApp(ctk.CTk):
 
         self._compact_view = False
         self._full_geometry_before_compact = None
+        self._compact_fixed_width = None
+        self._enforcing_compact_window = False
+        self._compact_fullscreen_exit_in_progress = False
+        self._normal_window_minsize = None
+        self._normal_window_maxsize = None
+        self._normal_window_resizable = (True, True)
         self.btn_toggle_view = ctk.CTkButton(
             sidebar,
             text="Kleine Ansicht",
@@ -1633,6 +1654,8 @@ class TscribaRecorderApp(ctk.CTk):
 
         self.after(0, self._ensure_log_width)
         self.after(0, self._sync_main_layout)
+        self.after(0, self._capture_default_window_constraints)
+        self.bind("<Configure>", self._on_window_configure, add="+")
 
     def _spin_set_state(self, spin, state):
         try:
@@ -2371,6 +2394,7 @@ class TscribaRecorderApp(ctk.CTk):
         self._sync_main_layout()
         if bool(getattr(self, "_compact_view", False)):
             self._apply_compact_window_size(log_visible=(not self._log_collapsed))
+            self._apply_window_constraints_for_mode()
 
     def _toggle_compact_view(self):
         turning_on = not bool(getattr(self, "_compact_view", False))
@@ -2385,8 +2409,10 @@ class TscribaRecorderApp(ctk.CTk):
         self._sync_main_layout()
         if self._compact_view:
             self._apply_compact_window_size(log_visible=(not self._log_collapsed))
+            self._apply_window_constraints_for_mode()
         else:
             self._restore_full_window_geometry()
+            self._apply_window_constraints_for_mode()
 
     def _pane_has(self, pane) -> bool:
         try:
@@ -2513,10 +2539,128 @@ class TscribaRecorderApp(ctk.CTk):
         except Exception:
             pass
 
+    def _capture_default_window_constraints(self):
+        try:
+            self._normal_window_minsize = tuple(map(int, self.minsize()))
+        except Exception:
+            self._normal_window_minsize = (1, 1)
+        try:
+            self._normal_window_maxsize = tuple(map(int, self.maxsize()))
+        except Exception:
+            self._normal_window_maxsize = (10_000, 10_000)
+        try:
+            rs = self.resizable()
+            if isinstance(rs, tuple) and len(rs) == 2:
+                self._normal_window_resizable = (bool(rs[0]), bool(rs[1]))
+        except Exception:
+            self._normal_window_resizable = (True, True)
+
+    def _force_exit_fullscreen_if_compact(self):
+        if not bool(getattr(self, "_compact_view", False)):
+            return
+        if bool(getattr(self, "_compact_fullscreen_exit_in_progress", False)):
+            return
+        fullscreen_active = False
+        zoomed_active = False
+        try:
+            fullscreen_active = bool(self.attributes("-fullscreen"))
+        except Exception:
+            fullscreen_active = False
+        try:
+            zoomed_active = (str(self.state()).lower() == "zoomed")
+        except Exception:
+            zoomed_active = False
+        if (not fullscreen_active) and (not zoomed_active):
+            return
+        self._compact_fullscreen_exit_in_progress = True
+        # New behavior: fullscreen request in Small View switches app back to Large View.
+        try:
+            self._compact_view = False
+            try:
+                self.btn_toggle_view.configure(text="Kleine Ansicht")
+            except Exception:
+                pass
+            self._refresh_log_toggle_label()
+            self._sync_main_layout()
+            self._restore_full_window_geometry()
+            self._apply_window_constraints_for_mode()
+        except Exception:
+            pass
+        try:
+            self.after(250, lambda: setattr(self, "_compact_fullscreen_exit_in_progress", False))
+        except Exception:
+            self._compact_fullscreen_exit_in_progress = False
+
+    def _enforce_compact_width(self):
+        if not bool(getattr(self, "_compact_view", False)):
+            return
+        target_w = int(getattr(self, "_compact_fixed_width", 0) or 0)
+        if target_w <= 0 or bool(getattr(self, "_enforcing_compact_window", False)):
+            return
+        g = self._current_window_geometry()
+        if g is None:
+            return
+        w, h, x, y = g
+        if abs(int(w) - target_w) <= 1:
+            return
+        self._enforcing_compact_window = True
+        try:
+            self._set_window_geometry(target_w, h, x, y)
+        finally:
+            self._enforcing_compact_window = False
+
+    def _apply_window_constraints_for_mode(self):
+        compact = bool(getattr(self, "_compact_view", False))
+        if compact:
+            target_w = int(self._compact_target_width(log_visible=(not self._log_collapsed)))
+            self._compact_fixed_width = target_w
+            try:
+                self.resizable(False, True)
+            except Exception:
+                pass
+            try:
+                min_h = max(320, int(self.winfo_reqheight() or 320))
+                self.minsize(target_w, min_h)
+            except Exception:
+                pass
+            try:
+                max_h = 10_000
+                if isinstance(self._normal_window_maxsize, tuple) and len(self._normal_window_maxsize) == 2:
+                    max_h = max(int(self._normal_window_maxsize[1]), 320)
+                self.maxsize(target_w, max_h)
+            except Exception:
+                pass
+            self._force_exit_fullscreen_if_compact()
+            self._enforce_compact_width()
+            return
+
+        self._compact_fixed_width = None
+        try:
+            rw, rh = self._normal_window_resizable if isinstance(self._normal_window_resizable, tuple) else (True, True)
+            self.resizable(bool(rw), bool(rh))
+        except Exception:
+            pass
+        try:
+            mw, mh = self._normal_window_minsize if isinstance(self._normal_window_minsize, tuple) else (1, 1)
+            self.minsize(int(mw), int(mh))
+        except Exception:
+            pass
+        try:
+            xw, xh = self._normal_window_maxsize if isinstance(self._normal_window_maxsize, tuple) else (10_000, 10_000)
+            self.maxsize(int(xw), int(xh))
+        except Exception:
+            pass
+
+    def _on_window_configure(self, _event=None):
+        if not bool(getattr(self, "_compact_view", False)):
+            return
+        self._force_exit_fullscreen_if_compact()
+        self._enforce_compact_width()
+
     def _compact_target_width(self, log_visible: bool) -> int:
         sidebar_w = int(getattr(self, "_sidebar_width", 230) or 230)
         if not log_visible:
-            return sidebar_w + 8
+            return sidebar_w
         log_w = int(self._log_last_width if self._log_last_width else 400)
         return sidebar_w + log_w + 16
 
@@ -2526,6 +2670,7 @@ class TscribaRecorderApp(ctk.CTk):
             return
         _w, h, x, y = g
         target_w = self._compact_target_width(log_visible=bool(log_visible))
+        self._compact_fixed_width = int(target_w)
         self._set_window_geometry(target_w, h, x, y)
 
     def _restore_full_window_geometry(self):
@@ -3127,6 +3272,7 @@ class TscribaRecorderApp(ctk.CTk):
                 pass
             self._sync_main_layout()
             self._apply_compact_window_size(log_visible=(not self._log_collapsed))
+            self._apply_window_constraints_for_mode()
 
     def toggle_pause(self):
         # Pause/Resume is currently only implemented for mic recording.
