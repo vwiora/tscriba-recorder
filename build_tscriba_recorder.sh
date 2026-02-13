@@ -68,15 +68,24 @@ EOF
 # -----------------------------------------------------------------------------
 # Build native helper (Swift) for system audio
 # -----------------------------------------------------------------------------
-echo "Building system audio helper..."
+echo "Building system audio helpers..."
 mkdir -p native/build
+SWIFT_CACHE_DIR="${TMPDIR:-/tmp}/swift-module-cache"
+CLANG_CACHE_DIR="${TMPDIR:-/tmp}/clang-module-cache"
+mkdir -p "$SWIFT_CACHE_DIR" "$CLANG_CACHE_DIR"
 
-swiftc -O -parse-as-library \
+SWIFT_MODULECACHE_PATH="$SWIFT_CACHE_DIR" CLANG_MODULE_CACHE_PATH="$CLANG_CACHE_DIR" swiftc -O -parse-as-library \
   -framework ScreenCaptureKit \
   -framework AVFoundation \
   -framework CoreMedia \
   -o native/build/system_audio_capture \
   native/system_audio_capture.swift
+
+SWIFT_MODULECACHE_PATH="$SWIFT_CACHE_DIR" CLANG_MODULE_CACHE_PATH="$CLANG_CACHE_DIR" swiftc -O -parse-as-library \
+  -framework CoreAudio \
+  -framework AudioToolbox \
+  -o native/build/system_audio_tap \
+  native/system_audio_tap.swift
 
 # -----------------------------------------------------------------------------
 # PyInstaller build
@@ -122,11 +131,13 @@ HELPER_DIR="dist/${APP_NAME}.app/Contents/Helpers"
 mkdir -p "$HELPER_DIR"
 cp native/build/system_audio_capture "$HELPER_DIR/system_audio_capture"
 chmod +x "$HELPER_DIR/system_audio_capture"
+cp native/build/system_audio_tap "$HELPER_DIR/system_audio_tap"
+chmod +x "$HELPER_DIR/system_audio_tap"
 
 # -----------------------------------------------------------------------------
 # Info.plist permissions (required for mic prompt)
 # -----------------------------------------------------------------------------
-echo "Setting microphone permission string in Info.plist..."
+echo "Setting permission strings in Info.plist..."
 PLIST="dist/${APP_NAME}.app/Contents/Info.plist"
 
 /usr/libexec/PlistBuddy -c \
@@ -134,6 +145,20 @@ PLIST="dist/${APP_NAME}.app/Contents/Info.plist"
   "$PLIST" 2>/dev/null || \
 /usr/libexec/PlistBuddy -c \
   "Set :NSMicrophoneUsageDescription \"Audioaufnahme (Mikrofon) für ${APP_NAME}.\"" \
+  "$PLIST"
+
+/usr/libexec/PlistBuddy -c \
+  "Add :NSAudioCaptureUsageDescription string \"Systemaudioaufnahme mit Core Audio taps für ${APP_NAME}.\"" \
+  "$PLIST" 2>/dev/null || \
+/usr/libexec/PlistBuddy -c \
+  "Set :NSAudioCaptureUsageDescription \"Systemaudioaufnahme mit Core Audio taps für ${APP_NAME}.\"" \
+  "$PLIST"
+
+/usr/libexec/PlistBuddy -c \
+  "Add :NSScreenCaptureUsageDescription string \"Systemaudioaufnahme über ScreenCaptureKit für ${APP_NAME}.\"" \
+  "$PLIST" 2>/dev/null || \
+/usr/libexec/PlistBuddy -c \
+  "Set :NSScreenCaptureUsageDescription \"Systemaudioaufnahme über ScreenCaptureKit für ${APP_NAME}.\"" \
   "$PLIST"
 
 # -----------------------------------------------------------------------------
@@ -149,6 +174,10 @@ echo "Codesigning (ad-hoc)..."
 codesign --force --sign - --timestamp=none \
   --identifier "${BUNDLE_ID}.system_audio_capture" \
   "dist/${APP_NAME}.app/Contents/Helpers/system_audio_capture" || true
+
+codesign --force --sign - --timestamp=none \
+  --identifier "${BUNDLE_ID}.system_audio_tap" \
+  "dist/${APP_NAME}.app/Contents/Helpers/system_audio_tap" || true
 
 codesign --force --deep --sign - --timestamp=none \
   "dist/${APP_NAME}.app" || true

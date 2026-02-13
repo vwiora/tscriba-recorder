@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WebCapture Launcher</title>
+  <style>
+    :root {
+      --bg: #0f1620;
+      --panel: #1a2634;
+      --text: #e9f1f9;
+      --muted: #9fb2c6;
+      --ok: #2fa36f;
+      --btn: #3a4d62;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      color: var(--text);
+      background: radial-gradient(70vw 60vh at 20% 20%, #1d2a39 0%, var(--bg) 70%);
+    }
+    .card {
+      width: min(620px, 92vw);
+      background: linear-gradient(170deg, #223042, var(--panel));
+      border: 1px solid #31465b;
+      border-radius: 14px;
+      padding: 22px;
+    }
+    h1 { margin: 0 0 10px; font-size: 1.1rem; }
+    p { margin: 8px 0; color: var(--muted); }
+    .row { margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap; }
+    button {
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-weight: 700;
+      color: #fff;
+      background: var(--btn);
+      cursor: pointer;
+    }
+    button.primary { background: var(--ok); }
+    .mono { font-variant-numeric: tabular-nums; }
+    .status { margin-top: 12px; min-height: 1.3em; }
+    a { color: #a6d8ff; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>WebCapture Service Launcher</h1>
+    <p>Open this file directly in your browser. It will discover the running local helper and open the UI.</p>
+    <p>Search range: <span class="mono">127.0.0.1:8765..8815</span></p>
+
+    <div class="row">
+      <button id="scanBtn" class="primary">Find Service</button>
+      <button id="openDefaultBtn">Open Default (8765)</button>
+    </div>
+
+    <div id="status" class="status mono">Idle.</div>
+    <div id="result" class="mono"></div>
+  </main>
+
+  <script>
+    const scanBtn = document.getElementById("scanBtn");
+    const openDefaultBtn = document.getElementById("openDefaultBtn");
+    const statusEl = document.getElementById("status");
+    const resultEl = document.getElementById("result");
+
+    const HOST = "127.0.0.1";
+    const START = 8765;
+    const END = 8815;
+
+    function setStatus(msg) { statusEl.textContent = msg; }
+    function setResult(html) { resultEl.innerHTML = html; }
+
+    async function probePort(port) {
+      const ctrl = new AbortController();
+      const timeout = setTimeout(() => ctrl.abort(), 300);
+      try {
+        const url = `http://${HOST}:${port}/state`;
+        const res = await fetch(url, { signal: ctrl.signal, mode: "cors", cache: "no-store" });
+        if (!res.ok) return null;
+        const json = await res.json();
+        if (typeof json.running === "boolean") return `http://${HOST}:${port}/`;
+      } catch (_) {
+      } finally {
+        clearTimeout(timeout);
+      }
+      return null;
+    }
+
+    async function findService() {
+      setStatus("Scanning ports...");
+      setResult("");
+      for (let p = START; p <= END; p += 1) {
+        const found = await probePort(p);
+        if (found) {
+          setStatus(`Service found at ${found}`);
+          setResult(`<a href="${found}" target="_blank" rel="noopener">Open WebCapture UI</a>`);
+          window.open(found, "_blank", "noopener");
+          return;
+        }
+      }
+      setStatus("No service found.");
+      setResult("Start helper: <code>./webcapture/run_mvp.sh</code>");
+    }
+
+    scanBtn.addEventListener("click", findService);
+    openDefaultBtn.addEventListener("click", () => {
+      const url = `http://${HOST}:${START}/`;
+      window.open(url, "_blank", "noopener");
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,137 @@
+Core Audio Capture MVP - Developer Handover
+===========================================
+
+Project path
+------------
+/Users/volkerwiora/Projects/Transcriba Recorder/webcapture
+
+Self-contained scope
+--------------------
+Everything required for this MVP is now inside /webcapture (source, scripts, HTML, and local build outputs).
+No source files outside /webcapture are required anymore.
+
+Purpose
+-------
+This MVP proves that a browser UI can control and monitor macOS system-audio capture by using a local native helper process. Browser JavaScript does NOT call Core Audio directly. It talks to a localhost service.
+
+What "Core Audio taps" means (brief)
+-------------------------------------
+Core Audio taps (macOS 14.4+) are system-level capture APIs that let an app tap audio being played by the system/processes, without virtual loopback drivers. In this MVP, the native helper creates a process tap and streams PCM frames for level metering.
+
+Current MVP architecture
+------------------------
+1) Native tap binary
+   - File: webcapture/bin/system_audio_tap
+   - Source in folder: webcapture/system_audio_tap.swift
+   - Uses Core Audio APIs (AudioHardwareCreateProcessTap, aggregate device + IOProc)
+
+2) Local bridge service
+   - File: webcapture/system_audio_tap_web_helper.py
+   - Provides HTTP endpoints for browser control:
+     - GET  /state
+     - POST /start
+     - POST /stop
+     - GET  /events (SSE level updates)
+     - GET  / (serves MVP UI)
+   - Computes dBFS from float32 frames coming from native tap helper
+
+3) Browser UI
+   - File: webcapture/system_audio_tap_mvp.html
+   - ON/OFF button + live dB meter
+
+4) Direct launcher page (openable from Finder)
+   - File: webcapture/open_webcapture.html
+   - Scans localhost ports 8765..8815 and opens running service UI
+
+5) macOS app wrapper
+   - Build script: webcapture/build_app.sh
+   - Output app: webcapture/dist/Core Audio Capture MVP.app
+   - App starts packaged service binary in background and opens launcher page
+
+Build and run (developer)
+-------------------------
+A) Build native tap helper:
+   cd webcapture && ./build_helper.sh
+
+B) Run service in Terminal (dev mode):
+   cd webcapture && ./run_mvp.sh
+
+C) Build no-Terminal app:
+   cd webcapture && ./setup_python_env.sh && ./build_app.sh
+
+D) Launch app:
+   open "dist/Core Audio Capture MVP.app"
+
+E) Stop background service:
+   cd webcapture && ./stop_service.sh
+
+TCC / permissions notes
+-----------------------
+- macOS permission category: "Screen & System Audio Recording" (System audio only section).
+- Important: if launched via python3, TCC may show "python3" as requesting app.
+- This MVP now packages the service as a standalone executable (`core_audio_capture_service`) to reduce python3 attribution.
+- For clean testing:
+  1. stop old service
+  2. remove stale TCC entries
+  3. launch only Core Audio Capture MVP.app
+
+How to integrate into another project
+-------------------------------------
+1) Reuse local service contract
+   - Keep /state, /start, /stop, /events API stable.
+   - UI/frontend can remain framework-agnostic.
+
+2) Decide packaging model
+   - Embedded app helper (recommended for desktop product).
+   - Keep native tap binary and service binary inside app bundle Resources.
+
+3) Harden production concerns
+   - Structured logging
+   - Better error classification for TCC denial vs runtime failures
+   - Health endpoint and startup timeout handling
+   - Signed/notarized distribution build pipeline
+
+4) Optional future extensions
+   - Stream PCM to browser via WebSocket/WebRTC (not only level)
+   - Multiple sessions / authorization token for localhost API
+
+Known constraints
+-----------------
+- macOS only (Core Audio taps require recent macOS).
+- Requires explicit user permission in Privacy settings.
+- Browser cannot directly use Core Audio APIs.
+
+Packaging dependency
+--------------------
+- App packaging uses PyInstaller.
+- For clean handover on another machine:
+  1. cd webcapture
+  2. ./setup_python_env.sh
+  3. ./build_app.sh
+
+Windows equivalent approach (high-level)
+----------------------------------------
+Core Audio taps do not exist on Windows. Equivalent strategy is loopback capture:
+
+Option 1: WASAPI loopback (recommended)
+- Use Windows Core Audio APIs via WASAPI loopback (IAudioClient in loopback mode).
+- Captures system render stream from output device.
+- Implement native helper in C++/Rust/C#; expose localhost API similar to this MVP.
+
+Option 2: Windows Audio Graph / Media Foundation pipeline
+- Possible for app-centric capture scenarios, usually more complex and less direct than WASAPI loopback for pure system capture.
+
+Suggested Windows parity architecture
+-------------------------------------
+- Native capture helper (WASAPI loopback) -> stdout or IPC frames
+- Local service wrapper (HTTP/SSE/WebSocket) with same endpoints as macOS MVP
+- Shared browser UI consuming identical API contract
+
+This gives cross-platform UI reuse while swapping only the OS-specific capture backend.
+
+Files to inspect first
+----------------------
+- /Users/volkerwiora/Projects/Transcriba Recorder/webcapture/build_app.sh
+- /Users/volkerwiora/Projects/Transcriba Recorder/webcapture/system_audio_tap_web_helper.py
+- /Users/volkerwiora/Projects/Transcriba Recorder/webcapture/system_audio_tap_mvp.html
+- /Users/volkerwiora/Projects/Transcriba Recorder/webcapture/system_audio_tap.swift

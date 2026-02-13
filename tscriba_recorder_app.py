@@ -16,6 +16,15 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 import numpy as np  # type: ignore
 import sounddevice as sd  # type: ignore
+from system_audio_backend import (
+    SYSTEM_AUDIO_BACKEND_SCK,
+    SYSTEM_AUDIO_BACKEND_COREAUDIO,
+    SYSTEM_AUDIO_BACKEND_LABELS,
+    normalize_system_audio_backend as _normalize_system_audio_backend,
+    system_audio_permission_hint_message,
+    system_audio_permission_denied_message,
+    SystemAudioHelper,
+)
 # Optional tray/menu bar controls (Windows tray / macOS menu bar)
 try:
     import pystray  # type: ignore
@@ -264,8 +273,6 @@ def _unique_session_dir(base_dir: str, session_name: str) -> str:
 # ScreenCaptureKit System Audio Helper (Swift CLI embedded in .app)
 # ------------------------------------------------------------------
 
-_HDR = struct.Struct("<IHHI")  # frames(u32), channels(u16), fmt(u16), nbytes(u32); little-endian
-
 def _bundle_root():
     """Return Path to *.app bundle root if running from a bundled app, else None."""
     exe = os.path.realpath(sys.executable)
@@ -274,240 +281,6 @@ def _bundle_root():
         # .../Tscriba Recorder.app/Contents/MacOS/Tscriba Recorder -> .../Tscriba Recorder.app
         return Path(exe).parents[2]
     return None
-
-def _system_audio_helper_path():
-    """Locate embedded helper first; fall back to native/build for dev runs."""
-    br = _bundle_root()
-    if br is not None:
-        p = br / "Contents" / "Helpers" / "system_audio_capture"
-        if p.exists():
-            return p
-    here = Path(__file__).resolve().parent
-    return here / "native" / "build" / "system_audio_capture"
-
-class SystemAudioHelper:
-    """Start the Swift ScreenCaptureKit helper and write received audio to a WAV file.
-
-    Reads framed float32 interleaved PCM from helper stdout (see Swift code),
-    converts to int16 WAV for compatibility.
-    """
-
-    def __init__(self, wav_path: Optional[str], sample_rate: int = 48000, status_cb=None, level_cb=None, no_write: bool = False):
-        self.wav_path = wav_path
-        self.sample_rate = int(sample_rate)
-        self._status_cb = status_cb
-        self._level_cb = level_cb
-        self.no_write = bool(no_write)
-        self._proc = None
-        self._stop_evt = threading.Event()
-        self._thread = None
-        self._stderr_thread = None
-        self._bytes_written = 0
-        self._started_writing = False
-        self._audio_tap = None  # optional callback for live transcription (receives float32 frames)
-
-    @property
-    def is_running(self) -> bool:
-        return self._proc is not None
-
-    def start(self):
-        if self.is_running:
-            return
-        helper = _system_audio_helper_path()
-        if not helper.exists():
-            raise FileNotFoundError(f"Systemaudio helper not found: {helper}")
-
-        # Ensure output directory exists (recording mode).
-        if (not self.no_write) and self.wav_path:
-            out_dir = os.path.dirname(self.wav_path)
-            if out_dir:
-                os.makedirs(out_dir, exist_ok=True)
-
-        self._stop_evt.clear()
-        self._proc = subprocess.Popen(
-            [str(helper)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-            bufsize=0,
-        )
-
-        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self._thread.start()
-
-        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
-        self._stderr_thread.start()
-
-    def stop(self):
-        self._stop_evt.set()
-        p = self._proc
-        self._proc = None
-        if p is None:
-            return
-        try:
-            p.terminate()
-        except Exception:
-            pass
-
-        # Best-effort: wait a moment so WAV header can be finalized by writer thread.
-        try:
-            if self._thread is not None:
-                self._thread.join(timeout=1.5)
-        except Exception:
-            pass
-
-        try:
-            if self._stderr_thread is not None:
-                self._stderr_thread.join(timeout=0.5)
-        except Exception:
-            pass
-
-    def set_audio_tap(self, cb: Optional[Callable]):
-        """Set a callback that receives raw float32 PCM frames.
-
-        cb(audio: np.ndarray, samplerate: int, channels: int) -> None
-        Audio is interleaved float32 from the helper, shaped (nframes, nch).
-        """
-        self._audio_tap = cb
-
-    def _emit_status(self, msg: str):
-        if callable(self._status_cb):
-            try:
-                self._status_cb(msg)
-            except Exception:
-                pass
-
-    def _drain_stderr(self):
-        p = self._proc
-        if p is None or p.stderr is None:
-            return
-        try:
-            while not self._stop_evt.is_set():
-                line = p.stderr.readline()
-                if not line:
-                    break
-                s = line.decode(errors="replace").strip()
-                if s:
-                    # Surface errors and important state messages.
-                    if ("Failed" in s) or ("error" in s.lower()) or ("started" in s.lower()):
-                        self._emit_status(f"Systemaudio: {s}")
-        except Exception:
-            pass
-
-    def _reader_loop(self):
-        p = self._proc
-        if p is None or p.stdout is None:
-            return
-
-        # Test mode: read/process levels/taps, but do not write WAV files.
-        if self.no_write:
-            try:
-                while not self._stop_evt.is_set():
-                    h = p.stdout.read(_HDR.size)
-                    if not h or len(h) != _HDR.size:
-                        break
-                    nframes, nch, fmt, nbytes = _HDR.unpack(h)
-                    payload = p.stdout.read(nbytes)
-                    if len(payload) != nbytes:
-                        break
-                    if fmt != 1:
-                        self._emit_status(f"Systemaudio: unexpected format code {fmt}")
-                        break
-                    if self._audio_tap is not None:
-                        try:
-                            a = np.frombuffer(payload, dtype=np.float32)
-                            if a.size == int(nframes) * int(nch):
-                                a = a.reshape(int(nframes), int(nch))
-                                self._audio_tap(a, int(self.sample_rate), int(nch))
-                        except Exception:
-                            pass
-                    if self._level_cb is not None:
-                        try:
-                            floats = np.frombuffer(payload, dtype=np.float32)
-                            if floats.size > 0:
-                                rms = float(np.sqrt(np.mean(np.square(floats))))
-                                db = 20.0 * np.log10(max(rms, 1e-12))
-                                self._level_cb(db)
-                        except Exception:
-                            pass
-            except Exception as e:
-                self._emit_status(f"Systemaudio: reader error: {e}")
-            return
-
-        try:
-            # Open file handle explicitly so the file exists immediately.
-            with open(self.wav_path, "wb") as raw_f:
-                with wave.open(raw_f, "wb") as w:
-                    w.setsampwidth(2)  # int16
-                    w.setframerate(self.sample_rate)
-                    first = True
-
-                    while not self._stop_evt.is_set():
-                        h = p.stdout.read(_HDR.size)
-                        if not h or len(h) != _HDR.size:
-                            break
-                        nframes, nch, fmt, nbytes = _HDR.unpack(h)
-                        payload = p.stdout.read(nbytes)
-                        if len(payload) != nbytes:
-                            break
-
-                        if fmt != 1:
-                            self._emit_status(f"Systemaudio: unexpected format code {fmt}")
-                            break
-
-                        if first:
-                            w.setnchannels(int(nch))
-                            first = False
-
-                        # Optional: forward raw float32 frames to a live-transcription tap.
-                        if self._audio_tap is not None:
-                            try:
-                                import numpy as np  # type: ignore
-                                a = np.frombuffer(payload, dtype=np.float32)
-                                if a.size == int(nframes) * int(nch):
-                                    a = a.reshape(int(nframes), int(nch))
-                                    self._audio_tap(a, int(self.sample_rate), int(nch))
-                            except Exception:
-                                pass
-
-                        floats = struct.unpack("<" + "f" * (nframes * nch), payload)
-                        out = bytearray()
-                        sum_sq = 0.0
-                        cnt = 0
-                        for x in floats:
-                            if x != x:
-                                x = 0.0
-                            if x > 1.0:
-                                x = 1.0
-                            if x < -1.0:
-                                x = -1.0
-                            sum_sq += float(x) * float(x)
-                            cnt += 1
-                            out += struct.pack("<h", int(x * 32767.0))
-
-                        # Compute a rough level meter for system audio (dBFS) and surface it via callback.
-                        if self._level_cb is not None and cnt > 0:
-                            try:
-                                import math
-                                rms = math.sqrt(sum_sq / float(cnt))
-                                db = 20.0 * math.log10(max(rms, 1e-12))
-                                self._level_cb(db)
-                            except Exception:
-                                pass
-                        w.writeframesraw(out)
-                        self._bytes_written += len(out)
-                        if not self._started_writing:
-                            self._started_writing = True
-                            self._emit_status("Systemaudio: receiving audio …")
-
-                        # Flush periodically so file grows on disk during recording.
-                        try:
-                            raw_f.flush()
-                        except Exception:
-                            pass
-        except Exception as e:
-            self._emit_status(f"Systemaudio: writer error: {e}")
-
 
 class _EchoCanceller:
     def __init__(self, sample_rate: int):
@@ -1190,10 +963,17 @@ class TscribaRecorderApp(ctk.CTk):
         self.transcription_model_size_var = tk.StringVar(value="small")
         self.appearance_mode = tk.StringVar(value="System")
         self.recordings_root_var = tk.StringVar(value=default_recordings_dir())
+        self.system_audio_backend_var = tk.StringVar(value=SYSTEM_AUDIO_BACKEND_LABELS[SYSTEM_AUDIO_BACKEND_SCK])
         self.auto_small_on_recording_var = tk.BooleanVar(value=False)
+        self.auto_stop_on_silence_var = tk.BooleanVar(value=False)
+        self.silence_threshold_db_var = tk.DoubleVar(value=-55.0)
+        self.silence_duration_seconds_var = tk.DoubleVar(value=8.0)
         self.auto_duck_var = tk.BooleanVar(value=False)
         self.auto_duck_strength_var = tk.DoubleVar(value=18.0)
         self.aec_enabled_var = tk.BooleanVar(value=True)
+        self._silence_started_at = None
+        self._silence_grace_until = 0.0
+        self._silence_autostop_triggered = False
         # Recorder settings vars (init early for settings load)
         self.sr_var = tk.IntVar(value=48000)
         self.ch_var = tk.IntVar(value=1)
@@ -1345,7 +1125,12 @@ class TscribaRecorderApp(ctk.CTk):
             self.auto_duck_strength_var.set(float(data.get("auto_duck_strength_db", self.auto_duck_strength_var.get() or 18.0)))
             self.aec_enabled_var.set(bool(data.get("aec_enabled", self.aec_enabled_var.get())))
             self.recordings_root_var.set(str(data.get("recordings_root", self.recordings_root_var.get() or default_recordings_dir())))
+            backend = _normalize_system_audio_backend(data.get("system_audio_backend", SYSTEM_AUDIO_BACKEND_SCK))
+            self.system_audio_backend_var.set(SYSTEM_AUDIO_BACKEND_LABELS.get(backend, SYSTEM_AUDIO_BACKEND_LABELS[SYSTEM_AUDIO_BACKEND_SCK]))
             self.auto_small_on_recording_var.set(bool(data.get("auto_small_on_recording", self.auto_small_on_recording_var.get())))
+            self.auto_stop_on_silence_var.set(bool(data.get("auto_stop_on_silence", self.auto_stop_on_silence_var.get())))
+            self.silence_threshold_db_var.set(float(data.get("silence_threshold_db", self.silence_threshold_db_var.get() or -55.0)))
+            self.silence_duration_seconds_var.set(float(data.get("silence_duration_seconds", self.silence_duration_seconds_var.get() or 8.0)))
             try:
                 global RECORDINGS_ROOT_OVERRIDE
                 RECORDINGS_ROOT_OVERRIDE = self.recordings_root_var.get()
@@ -1368,6 +1153,18 @@ class TscribaRecorderApp(ctk.CTk):
         ch = self._spin_read_value(self.ch_spin, self.ch_var.get() or 1, cast=int)
         mic_gain = self._spin_read_value(self.mic_gain_spin, self.mic_gain_var.get() or 0.0, cast=float)
         sys_gain = self._spin_read_value(self.sys_gain_spin, self.sys_gain_var.get() or 9.0, cast=float)
+        silence_threshold = self._spin_read_value(
+            getattr(self, "silence_threshold_spin", None),
+            self.silence_threshold_db_var.get() or -55.0,
+            cast=float,
+        )
+        silence_duration = self._spin_read_value(
+            getattr(self, "silence_duration_spin", None),
+            self.silence_duration_seconds_var.get() or 8.0,
+            cast=float,
+        )
+        silence_threshold = max(-120.0, min(0.0, float(silence_threshold)))
+        silence_duration = max(1.0, min(3600.0, float(silence_duration)))
         data = {
             "sample_rate": int(sr),
             "channels": int(ch),
@@ -1384,13 +1181,19 @@ class TscribaRecorderApp(ctk.CTk):
             "auto_duck_strength_db": float(self.auto_duck_strength_var.get() or 18.0),
             "aec_enabled": bool(self.aec_enabled_var.get()),
             "recordings_root": str(self.recordings_root_var.get() or ""),
+            "system_audio_backend": _normalize_system_audio_backend(self.system_audio_backend_var.get()),
             "auto_small_on_recording": bool(self.auto_small_on_recording_var.get()),
+            "auto_stop_on_silence": bool(self.auto_stop_on_silence_var.get()),
+            "silence_threshold_db": float(silence_threshold),
+            "silence_duration_seconds": float(silence_duration),
         }
         try:
             self.sr_var.set(int(sr))
             self.ch_var.set(int(ch))
             self.mic_gain_var.set(float(mic_gain))
             self.sys_gain_var.set(float(sys_gain))
+            self.silence_threshold_db_var.set(float(silence_threshold))
+            self.silence_duration_seconds_var.set(float(silence_duration))
         except Exception:
             pass
         try:
@@ -1472,8 +1275,8 @@ class TscribaRecorderApp(ctk.CTk):
                 corner_radius=0,
                 border_width=0,
                 fg_color="transparent",
-                hover_color="#cfe8c9",
-                text_color="#2e7d32",
+                hover_color=_resolve_color(TAB_HOVER_BG),
+                text_color=_resolve_color(TAB_TEXT_INACTIVE),
                 width=230,
                 height=36,
                 command=lambda n=name: self._select_tab(n),
@@ -1834,12 +1637,11 @@ class TscribaRecorderApp(ctk.CTk):
             checkbox_height=22,
         )
         self.rec_sys_chk.pack(side="left", padx=(0, 0))
-        self.sys_var = tk.StringVar(value="Systemaudio")
         self.sys_cb = ctk.CTkComboBox(
             r2_top,
-            variable=self.sys_var,
-            values=["Systemaudio"],
-            command=lambda _val: None,
+            variable=self.system_audio_backend_var,
+            values=list(SYSTEM_AUDIO_BACKEND_LABELS.values()),
+            command=lambda _val: self.on_mode_change(),
             font=_font(FONT_BASE),
             height=CONTROL_HEIGHT,
         )
@@ -1968,43 +1770,66 @@ class TscribaRecorderApp(ctk.CTk):
     def _build_settings_tab(self, parent):
         body = ctk.CTkFrame(parent, fg_color=BG_MAIN, corner_radius=0)
         body.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
-        body.grid_columnconfigure(0, weight=1, uniform="settings")
-        body.grid_columnconfigure(1, weight=1, uniform="settings")
-        body.grid_columnconfigure(2, weight=1, uniform="settings")
-        body.grid_rowconfigure(1, weight=1)
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(2, weight=1)
 
-        ctk.CTkLabel(body, text="Recorder Settings", font=_font(FONT_BASE), anchor="w").grid(
-            row=0, column=0, sticky="w"
-        )
+        settings_tabs = ctk.CTkTabview(body)
+        settings_tabs.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
+        try:
+            settings_tabs.configure(
+                fg_color=ENTRY_BG,
+                border_width=1,
+                border_color=ENTRY_BORDER,
+                segmented_button_fg_color=ENTRY_BG,
+                segmented_button_font=_font(size=FONT_BASE),
+                segmented_button_height=42,
+                segmented_button_padding=5,
+            )
+        except Exception:
+            pass
+        self._style_tabview_buttons(settings_tabs)
 
-        sec1 = ctk.CTkFrame(body, fg_color=BG_MAIN, corner_radius=12, border_width=1, border_color=ENTRY_BORDER)
-        sec1.grid(row=1, column=0, sticky="nsew", pady=(6, 12), padx=(0, 10))
-        r3 = ctk.CTkFrame(sec1, fg_color="transparent", corner_radius=0)
-        r3.pack(fill="x", padx=8, pady=(8, 0))
+        # Recordings tab (3-column layout)
+        rec_tab = settings_tabs.add("Recordings")
+        rec_tab.grid_rowconfigure(0, weight=1)
+        rec_tab.grid_columnconfigure(0, weight=1, uniform="settings_rec")
+        rec_tab.grid_columnconfigure(1, weight=1, uniform="settings_rec")
+        rec_tab.grid_columnconfigure(2, weight=1, uniform="settings_rec")
+
+        rec_col1 = ctk.CTkFrame(rec_tab, fg_color="transparent", corner_radius=0)
+        rec_col1.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
+        r3 = ctk.CTkFrame(rec_col1, fg_color="transparent", corner_radius=0)
+        r3.pack(fill="x", padx=8, pady=(8, 8))
         ctk.CTkLabel(r3, text="Sample rate", font=_font(FONT_BASE)).pack(anchor="w")
         self.sr_spin = self._make_spinbox(r3, self.sr_var, 8000, 192000, increment=1000, width=90, expand=True)
-        self.sr_spin.pack(fill="x", pady=(4, 8))
+        self.sr_spin.pack(fill="x", pady=(4, 0))
 
-        r3b = ctk.CTkFrame(sec1, fg_color="transparent", corner_radius=0)
-        r3b.pack(fill="x", padx=8, pady=(0, 0))
+        r3b = ctk.CTkFrame(rec_col1, fg_color="transparent", corner_radius=0)
+        r3b.pack(fill="x", padx=8, pady=(0, 8))
         ctk.CTkLabel(r3b, text="Channels", font=_font(FONT_BASE)).pack(anchor="w")
         self.ch_spin = self._make_spinbox(r3b, self.ch_var, 1, 2, increment=1, width=60, expand=True)
-        self.ch_spin.pack(fill="x", pady=(4, 8))
+        self.ch_spin.pack(fill="x", pady=(4, 0))
 
-        r3c = ctk.CTkFrame(sec1, fg_color="transparent", corner_radius=0)
-        r3c.pack(fill="x", padx=8, pady=(0, 0))
+        rec_col2 = ctk.CTkFrame(rec_tab, fg_color="transparent", corner_radius=0)
+        rec_col2.grid(row=0, column=1, sticky="nsew", padx=8, pady=(0, 8))
+
+        r3c = ctk.CTkFrame(rec_col2, fg_color="transparent", corner_radius=0)
+        r3c.pack(fill="x", padx=8, pady=(8, 8))
         ctk.CTkLabel(r3c, text="Mic gain (dB)", font=_font(FONT_BASE)).pack(anchor="w")
         self.mic_gain_spin = self._make_spinbox(r3c, self.mic_gain_var, -24, 24, increment=1, width=70, expand=True)
-        self.mic_gain_spin.pack(fill="x", pady=(4, 8))
+        self.mic_gain_spin.pack(fill="x", pady=(4, 0))
 
-        r3d = ctk.CTkFrame(sec1, fg_color="transparent", corner_radius=0)
-        r3d.pack(fill="x", padx=8, pady=(0, 0))
+        r3d = ctk.CTkFrame(rec_col2, fg_color="transparent", corner_radius=0)
+        r3d.pack(fill="x", padx=8, pady=(0, 8))
         ctk.CTkLabel(r3d, text="System gain (dB)", font=_font(FONT_BASE)).pack(anchor="w")
         self.sys_gain_spin = self._make_spinbox(r3d, self.sys_gain_var, -24, 24, increment=1, width=70, expand=True)
-        self.sys_gain_spin.pack(fill="x", pady=(4, 8))
+        self.sys_gain_spin.pack(fill="x", pady=(4, 0))
 
-        r3e = ctk.CTkFrame(sec1, fg_color="transparent", corner_radius=0)
-        r3e.pack(fill="x", padx=8, pady=(0, 8))
+        rec_col3 = ctk.CTkFrame(rec_tab, fg_color="transparent", corner_radius=0)
+        rec_col3.grid(row=0, column=2, sticky="nsew", padx=(8, 0), pady=(0, 8))
+
+        r3e = ctk.CTkFrame(rec_col3, fg_color="transparent", corner_radius=0)
+        r3e.pack(fill="x", padx=8, pady=(8, 8))
         self.auto_duck_chk = ctk.CTkCheckBox(
             r3e,
             text="Auto-duck Microphone",
@@ -2014,18 +1839,7 @@ class TscribaRecorderApp(ctk.CTk):
         )
         self.auto_duck_chk.pack(anchor="w")
 
-        r3e2 = ctk.CTkFrame(sec1, fg_color="transparent", corner_radius=0)
-        r3e2.pack(fill="x", padx=8, pady=(0, 8))
-        self.aec_chk = ctk.CTkCheckBox(
-            r3e2,
-            text="Echo Cancellation (AEC)",
-            variable=self.aec_enabled_var,
-            font=_font(FONT_BASE),
-            command=self._on_aec_toggle,
-        )
-        self.aec_chk.pack(anchor="w")
-
-        r3g = ctk.CTkFrame(sec1, fg_color="transparent", corner_radius=0)
+        r3g = ctk.CTkFrame(rec_col3, fg_color="transparent", corner_radius=0)
         r3g.pack(fill="x", padx=8, pady=(0, 8))
         ctk.CTkLabel(r3g, text="Auto-duck preset", font=_font(FONT_BASE)).pack(anchor="w")
         self.auto_duck_preset = ctk.CTkComboBox(
@@ -2042,67 +1856,68 @@ class TscribaRecorderApp(ctk.CTk):
             pass
         self.auto_duck_preset.pack(fill="x", pady=(4, 0))
 
-        ctk.CTkLabel(body, text="Transcription Settings", font=_font(FONT_BASE), anchor="w").grid(
-            row=0, column=1, sticky="w", padx=(10, 0)
-        )
-        ctk.CTkLabel(body, text="System Settings", font=_font(FONT_BASE), anchor="w").grid(
-            row=0, column=2, sticky="w", padx=(10, 0)
-        )
-        sec2 = ctk.CTkFrame(body, fg_color=BG_MAIN, corner_radius=12, border_width=1, border_color=ENTRY_BORDER)
-        sec2.grid(row=1, column=1, sticky="nsew", pady=(6, 12), padx=(10, 10))
-
-        sec3 = ctk.CTkFrame(body, fg_color=BG_MAIN, corner_radius=12, border_width=1, border_color=ENTRY_BORDER)
-        sec3.grid(row=1, column=2, sticky="nsew", pady=(6, 12), padx=(10, 0))
-
-        r7 = ctk.CTkFrame(sec3, fg_color="transparent", corner_radius=0)
-        r7.pack(fill="x", padx=8, pady=(8, 0))
-        ctk.CTkLabel(r7, text="Anzeige", font=_font(FONT_BASE)).pack(anchor="w")
-        self.appearance_menu = ctk.CTkComboBox(
-            r7,
-            values=["System", "Light", "Dark"],
-            variable=self.appearance_mode,
-            command=self._on_appearance_change,
+        r3e2 = ctk.CTkFrame(rec_col3, fg_color="transparent", corner_radius=0)
+        r3e2.pack(fill="x", padx=8, pady=(0, 8))
+        self.aec_chk = ctk.CTkCheckBox(
+            r3e2,
+            text="Echo Cancellation (AEC)",
+            variable=self.aec_enabled_var,
             font=_font(FONT_BASE),
-            height=CONTROL_HEIGHT,
+            command=self._on_aec_toggle,
         )
-        _style_entry(self.appearance_menu)
-        self.appearance_menu.pack(fill="x", pady=(4, 8))
+        self.aec_chk.pack(anchor="w")
 
-        r7b = ctk.CTkFrame(sec3, fg_color="transparent", corner_radius=0)
-        r7b.pack(fill="x", padx=8, pady=(0, 0))
-        ctk.CTkLabel(r7b, text="Aufnahmeordner", font=_font(FONT_BASE)).pack(anchor="w")
-        entry_root = ctk.CTkEntry(
-            r7b, textvariable=self.recordings_root_var, height=CONTROL_HEIGHT, font=_font(FONT_BASE)
-        )
-        _style_entry(entry_root)
-        try:
-            entry_root.configure(justify="right")
-        except Exception:
-            pass
-        entry_root.pack(fill="x", pady=(4, 8))
-
-        r7c = ctk.CTkFrame(sec3, fg_color="transparent", corner_radius=0)
-        r7c.pack(fill="x", padx=8, pady=(0, 8))
-        btn_root = ctk.CTkButton(
-            r7c, text="Auswählen…", command=self._browse_recordings_root, font=_font(FONT_BASE), height=CONTROL_HEIGHT
-        )
-        _style_button(btn_root)
-        btn_root.pack(side="right")
-
-        r7d = ctk.CTkFrame(sec3, fg_color="transparent", corner_radius=0)
-        r7d.pack(fill="x", padx=8, pady=(4, 8))
-        auto_small_chk = ctk.CTkCheckBox(
-            r7d,
-            text="Kleine Anzeige während Recordings einschalten",
-            variable=self.auto_small_on_recording_var,
+        r3h = ctk.CTkFrame(rec_col3, fg_color="transparent", corner_radius=0)
+        r3h.pack(fill="x", padx=8, pady=(0, 8))
+        self.auto_stop_silence_chk = ctk.CTkCheckBox(
+            r3h,
+            text="Auto-stop on Silence",
+            variable=self.auto_stop_on_silence_var,
             font=_font(FONT_BASE),
+            command=self._on_silence_autostop_toggle,
         )
-        auto_small_chk.pack(anchor="w")
+        self.auto_stop_silence_chk.pack(anchor="w")
 
+        r3h2 = ctk.CTkFrame(rec_col3, fg_color="transparent", corner_radius=0)
+        r3h2.pack(fill="x", padx=8, pady=(0, 8))
+        ctk.CTkLabel(r3h2, text="Silence threshold (max dBFS)", font=_font(FONT_BASE)).pack(anchor="w")
+        self.silence_threshold_spin = self._make_spinbox(
+            r3h2,
+            self.silence_threshold_db_var,
+            -120.0,
+            0.0,
+            increment=1.0,
+            width=90,
+            expand=True,
+        )
+        self.silence_threshold_spin.pack(fill="x", pady=(4, 0))
+
+        r3h3 = ctk.CTkFrame(rec_col3, fg_color="transparent", corner_radius=0)
+        r3h3.pack(fill="x", padx=8, pady=(0, 8))
+        ctk.CTkLabel(r3h3, text="Silence duration (s)", font=_font(FONT_BASE)).pack(anchor="w")
+        self.silence_duration_spin = self._make_spinbox(
+            r3h3,
+            self.silence_duration_seconds_var,
+            1.0,
+            3600.0,
+            increment=1.0,
+            width=90,
+            expand=True,
+        )
+        self.silence_duration_spin.pack(fill="x", pady=(4, 0))
+
+        # Live-Transcripts tab (3-column layout)
+        live_tab = settings_tabs.add("Live-Transcripts")
+        live_tab.grid_rowconfigure(0, weight=1)
+        live_tab.grid_columnconfigure(0, weight=1, uniform="settings_live")
+        live_tab.grid_columnconfigure(1, weight=1, uniform="settings_live")
+        live_tab.grid_columnconfigure(2, weight=1, uniform="settings_live")
         self._transcription_controls = []
 
-        r5b = ctk.CTkFrame(sec2, fg_color="transparent", corner_radius=0)
-        r5b.pack(fill="x", padx=8, pady=(8, 0))
+        live_col1 = ctk.CTkFrame(live_tab, fg_color="transparent", corner_radius=0)
+        live_col1.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
+        r5b = ctk.CTkFrame(live_col1, fg_color="transparent", corner_radius=0)
+        r5b.pack(fill="x", padx=8, pady=(8, 8))
         ctk.CTkLabel(r5b, text="Sprache", font=_font(FONT_BASE)).pack(anchor="w")
         menu_lang = ctk.CTkComboBox(
             r5b,
@@ -2112,48 +1927,10 @@ class TscribaRecorderApp(ctk.CTk):
             height=CONTROL_HEIGHT,
         )
         _style_entry(menu_lang)
-        menu_lang.pack(fill="x", pady=(4, 8))
+        menu_lang.pack(fill="x", pady=(4, 0))
         self._transcription_controls.append(menu_lang)
 
-        r5c = ctk.CTkFrame(sec2, fg_color="transparent", corner_radius=0)
-        r5c.pack(fill="x", padx=8, pady=(0, 0))
-        ctk.CTkLabel(r5c, text="Chunk (s)", font=_font(FONT_BASE)).pack(anchor="w")
-        chunk_spin = self._make_spinbox(
-            r5c, self.transcription_chunk_seconds_var, 0.5, 15.0, increment=0.1, width=70, expand=True
-        )
-        self._transcription_controls.append(chunk_spin)
-        chunk_spin.pack(fill="x", pady=(4, 8))
-
-        r5d = ctk.CTkFrame(sec2, fg_color="transparent", corner_radius=0)
-        r5d.pack(fill="x", padx=8, pady=(0, 0))
-        ctk.CTkLabel(r5d, text="Overlap (s)", font=_font(FONT_BASE)).pack(anchor="w")
-        overlap_spin = self._make_spinbox(
-            r5d, self.transcription_overlap_seconds_var, 0.0, 10.0, increment=0.1, width=70, expand=True
-        )
-        self._transcription_controls.append(overlap_spin)
-        overlap_spin.pack(fill="x", pady=(4, 8))
-
-        r5e = ctk.CTkFrame(sec2, fg_color="transparent", corner_radius=0)
-        r5e.pack(fill="x", padx=8, pady=(0, 0))
-        ctk.CTkLabel(r5e, text="Beam", font=_font(FONT_BASE)).pack(anchor="w")
-        beam_spin = self._make_spinbox(
-            r5e, self.transcription_beam_size_var, 1, 10, increment=1, width=60, expand=True
-        )
-        self._transcription_controls.append(beam_spin)
-        beam_spin.pack(fill="x", pady=(4, 8))
-
-        r5f = ctk.CTkFrame(sec2, fg_color="transparent", corner_radius=0)
-        r5f.pack(fill="x", padx=8, pady=(0, 0))
-        vad_chk = ctk.CTkCheckBox(
-            r5f,
-            text="Voice Activity Detection",
-            variable=self.transcription_vad_filter_var,
-            font=_font(FONT_BASE),
-        )
-        vad_chk.pack(fill="x", pady=(0, 8))
-        self._transcription_controls.append(vad_chk)
-
-        r5g = ctk.CTkFrame(sec2, fg_color="transparent", corner_radius=0)
+        r5g = ctk.CTkFrame(live_col1, fg_color="transparent", corner_radius=0)
         r5g.pack(fill="x", padx=8, pady=(0, 8))
         ctk.CTkLabel(r5g, text="Model", font=_font(FONT_BASE)).pack(anchor="w")
         menu_model = ctk.CTkComboBox(
@@ -2167,16 +1944,141 @@ class TscribaRecorderApp(ctk.CTk):
         menu_model.pack(fill="x", pady=(4, 0))
         self._transcription_controls.append(menu_model)
 
+        live_col2 = ctk.CTkFrame(live_tab, fg_color="transparent", corner_radius=0)
+        live_col2.grid(row=0, column=1, sticky="nsew", padx=8, pady=(0, 8))
+        r5c = ctk.CTkFrame(live_col2, fg_color="transparent", corner_radius=0)
+        r5c.pack(fill="x", padx=8, pady=(8, 8))
+        ctk.CTkLabel(r5c, text="Chunk (s)", font=_font(FONT_BASE)).pack(anchor="w")
+        chunk_spin = self._make_spinbox(
+            r5c, self.transcription_chunk_seconds_var, 0.5, 15.0, increment=0.1, width=70, expand=True
+        )
+        self._transcription_controls.append(chunk_spin)
+        chunk_spin.pack(fill="x", pady=(4, 0))
+
+        r5d = ctk.CTkFrame(live_col2, fg_color="transparent", corner_radius=0)
+        r5d.pack(fill="x", padx=8, pady=(0, 8))
+        ctk.CTkLabel(r5d, text="Overlap (s)", font=_font(FONT_BASE)).pack(anchor="w")
+        overlap_spin = self._make_spinbox(
+            r5d, self.transcription_overlap_seconds_var, 0.0, 10.0, increment=0.1, width=70, expand=True
+        )
+        self._transcription_controls.append(overlap_spin)
+        overlap_spin.pack(fill="x", pady=(4, 0))
+
+        live_col3 = ctk.CTkFrame(live_tab, fg_color="transparent", corner_radius=0)
+        live_col3.grid(row=0, column=2, sticky="nsew", padx=(8, 0), pady=(0, 8))
+        r5e = ctk.CTkFrame(live_col3, fg_color="transparent", corner_radius=0)
+        r5e.pack(fill="x", padx=8, pady=(8, 8))
+        ctk.CTkLabel(r5e, text="Beam", font=_font(FONT_BASE)).pack(anchor="w")
+        beam_spin = self._make_spinbox(
+            r5e, self.transcription_beam_size_var, 1, 10, increment=1, width=60, expand=True
+        )
+        self._transcription_controls.append(beam_spin)
+        beam_spin.pack(fill="x", pady=(4, 0))
+
+        r5f = ctk.CTkFrame(live_col3, fg_color="transparent", corner_radius=0)
+        r5f.pack(fill="x", padx=8, pady=(0, 8))
+        vad_chk = ctk.CTkCheckBox(
+            r5f,
+            text="Voice Activity Detection",
+            variable=self.transcription_vad_filter_var,
+            font=_font(FONT_BASE),
+        )
+        vad_chk.pack(fill="x", pady=(0, 0))
+        self._transcription_controls.append(vad_chk)
+
+        # General tab (single-column layout)
+        general_tab = settings_tabs.add("General")
+        general_tab.grid_rowconfigure(0, weight=1)
+        general_tab.grid_columnconfigure(0, weight=1)
+
+        sec3 = ctk.CTkFrame(general_tab, fg_color="transparent", corner_radius=0)
+        sec3.grid(row=0, column=0, sticky="new", pady=(0, 8))
+
+        r7 = ctk.CTkFrame(sec3, fg_color="transparent", corner_radius=0)
+        r7.pack(fill="x", padx=8, pady=(8, 8))
+        ctk.CTkLabel(r7, text="Anzeige", font=_font(FONT_BASE)).pack(anchor="w")
+        self.appearance_menu = ctk.CTkComboBox(
+            r7,
+            values=["System", "Light", "Dark"],
+            variable=self.appearance_mode,
+            command=self._on_appearance_change,
+            font=_font(FONT_BASE),
+            height=CONTROL_HEIGHT,
+        )
+        _style_entry(self.appearance_menu)
+        self.appearance_menu.pack(fill="x", pady=(4, 0))
+
+        r7b = ctk.CTkFrame(sec3, fg_color="transparent", corner_radius=0)
+        r7b.pack(fill="x", padx=8, pady=(0, 8))
+        ctk.CTkLabel(r7b, text="Aufnahmeordner", font=_font(FONT_BASE)).pack(anchor="w")
+        entry_root = ctk.CTkEntry(
+            r7b, textvariable=self.recordings_root_var, height=CONTROL_HEIGHT, font=_font(FONT_BASE)
+        )
+        _style_entry(entry_root)
+        entry_root.pack(fill="x", pady=(4, 0))
+
+        r7c = ctk.CTkFrame(sec3, fg_color="transparent", corner_radius=0)
+        r7c.pack(fill="x", padx=8, pady=(0, 8))
+        btn_root = ctk.CTkButton(
+            r7c, text="Auswählen…", command=self._browse_recordings_root, font=_font(FONT_BASE), height=CONTROL_HEIGHT
+        )
+        _style_button(btn_root)
+        btn_root.pack(side="right")
+
+        r7d = ctk.CTkFrame(sec3, fg_color="transparent", corner_radius=0)
+        r7d.pack(fill="x", padx=8, pady=(0, 8))
+        auto_small_chk = ctk.CTkCheckBox(
+            r7d,
+            text="Kleine Anzeige während Recordings einschalten",
+            variable=self.auto_small_on_recording_var,
+            font=_font(FONT_BASE),
+        )
+        auto_small_chk.pack(anchor="w")
+
+        r7e = ctk.CTkFrame(sec3, fg_color="transparent", corner_radius=0)
+        r7e.pack(fill="x", padx=8, pady=(0, 8))
+        ctk.CTkLabel(r7e, text="System Audio Backend", font=_font(FONT_BASE)).pack(anchor="w")
+        backend_menu = ctk.CTkComboBox(
+            r7e,
+            variable=self.system_audio_backend_var,
+            values=list(SYSTEM_AUDIO_BACKEND_LABELS.values()),
+            font=_font(FONT_BASE),
+            height=CONTROL_HEIGHT,
+            command=lambda _v: self.on_mode_change(),
+        )
+        _style_entry(backend_menu)
+        backend_menu.pack(fill="x", pady=(4, 0))
+
         btn_label = "Aktualisieren" if self._settings_loaded else "Speichern"
         self._btn_save_settings = ctk.CTkButton(
             body, text=btn_label, font=_font(FONT_BASE), height=CONTROL_HEIGHT, command=self._save_settings
         )
         _style_button(self._btn_save_settings)
-        self._btn_save_settings.grid(row=2, column=0, columnspan=3, sticky="e", pady=(6, 0))
+        self._btn_save_settings.grid(row=3, column=0, sticky="e", pady=(6, 0))
+
+        try:
+            settings_tabs.set("Recordings")
+        except Exception:
+            pass
+        self._on_silence_autostop_toggle()
 
         self._set_transcription_settings_enabled(
             bool(self.live_transcription_var.get()) and (bool(self.rec_mic_var.get()) or bool(self.rec_sys_var.get()))
         )
+
+    def _style_tabview_buttons(self, tabs):
+        try:
+            sb = getattr(tabs, "_segmented_button", None)
+            if sb is None:
+                return
+            buttons = getattr(sb, "_buttons_dict", {}) or {}
+            for btn in buttons.values():
+                try:
+                    btn.configure(border_spacing=5, font=_font(size=FONT_BASE))
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _add_record_controls(self, parent, label: str = "Recorder", pady=(10, 0)):
         row = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=0)
@@ -2357,13 +2259,24 @@ class TscribaRecorderApp(ctk.CTk):
         btn = self._tab_buttons.get(name)
         if btn is None:
             return
-        if self._current_tab == name:
+        if name in getattr(self, "_tab_disabled", set()):
+            try:
+                btn.configure(text_color=_resolve_color(READONLY_BG))
+            except Exception:
+                pass
             return
+        is_active = name == getattr(self, "_current_tab", None)
         try:
-            btn.configure(
-                fg_color=_resolve_color(TAB_HOVER_BG) if is_hover else "transparent",
-                text_color=_resolve_color(TAB_TEXT_INACTIVE),
-            )
+            if is_active:
+                btn.configure(
+                    fg_color=_resolve_color(TAB_HOVER_BG) if is_hover else _resolve_color(TAB_SELECTED_BG),
+                    text_color=_resolve_color(TAB_TEXT_INACTIVE) if is_hover else _resolve_color(TAB_TEXT_ACTIVE),
+                )
+            else:
+                btn.configure(
+                    fg_color=_resolve_color(TAB_HOVER_BG) if is_hover else "transparent",
+                    text_color=_resolve_color(TAB_TEXT_INACTIVE),
+                )
         except Exception:
             pass
 
@@ -2371,13 +2284,21 @@ class TscribaRecorderApp(ctk.CTk):
         btn = self._tab_buttons.get(name)
         if btn is None:
             return
+        if name in getattr(self, "_tab_disabled", set()):
+            return
         try:
-            btn.configure(fg_color=_resolve_color(TAB_HOVER_BG))
+            btn.configure(
+                fg_color=_resolve_color(TAB_HOVER_BG),
+                text_color=_resolve_color(TAB_TEXT_INACTIVE),
+            )
         except Exception:
             pass
 
     def _on_tab_release(self, name):
-        self._on_tab_hover(name, False)
+        try:
+            self._select_tab(name if name == getattr(self, "_current_tab", None) else self._current_tab)
+        except Exception:
+            pass
 
     def _toggle_log_panel(self):
         if self._log_collapsed:
@@ -2796,8 +2717,11 @@ class TscribaRecorderApp(ctk.CTk):
         self.mic_cb.configure(values=values)
         if self.mic_var.get() not in values and values:
             self.mic_var.set(values[0])
-        # Systemaudio: no input device selection in UI (ScreenCaptureKit comes later)
-        self.sys_var.set("Systemaudio")
+        # Systemaudio backend selection.
+        current_backend = _normalize_system_audio_backend(self.system_audio_backend_var.get())
+        self.system_audio_backend_var.set(
+            SYSTEM_AUDIO_BACKEND_LABELS.get(current_backend, SYSTEM_AUDIO_BACKEND_LABELS[SYSTEM_AUDIO_BACKEND_SCK])
+        )
 
         self.on_device_change()
 
@@ -2811,7 +2735,7 @@ class TscribaRecorderApp(ctk.CTk):
         return self._find_entry(self.mic_var.get())["id"]
 
     def selected_sys_id(self):
-        # Systemaudio will be captured via ScreenCaptureKit later (no input device selection)
+        # Systemaudio is captured by selected helper backend (no input device selection).
         return None
 
 
@@ -2819,14 +2743,32 @@ class TscribaRecorderApp(ctk.CTk):
     # UI logic
     # ------------------------------------------------------------------
 
-    def _has_systemaudio_permission(self) -> bool:
-        """Best-effort check for macOS "Bildschirm- & Systemaudioaufnahme" permission.
+    def _current_system_audio_backend(self) -> str:
+        return _normalize_system_audio_backend(self.system_audio_backend_var.get())
 
-        We use CoreGraphics' CGPreflightScreenCaptureAccess(), which returns whether
-        Screen Recording permission is granted without showing any prompt.
+    def _coreaudio_backend_supported_here(self) -> tuple[bool, str]:
+        if platform.system() != "Darwin":
+            return False, "Core Audio taps ist nur auf macOS verfügbar."
+        if _bundle_root() is None:
+            return (
+                False,
+                "Core Audio taps benötigt den Start aus der gebauten .app (dist/Transcriba Recorder.app), "
+                "nicht aus dem Python-Quelllauf.",
+            )
+        return True, ""
+
+    def _has_systemaudio_permission(self) -> bool:
+        """Best-effort check for macOS system audio permission.
+
+        ScreenCaptureKit backend uses CoreGraphics preflight for screen/audio permission.
+        Core Audio taps permission does not currently provide a preflight API here, so
+        we defer to runtime prompt/error handling in the helper.
         """
 
         if platform.system() != "Darwin":
+            return True
+
+        if self._current_system_audio_backend() != SYSTEM_AUDIO_BACKEND_SCK:
             return True
 
         try:
@@ -2915,26 +2857,19 @@ class TscribaRecorderApp(ctk.CTk):
                 except Exception:
                     pass
 
-        # One-time hint: macOS requires the "Screen & System Audio Recording" permission for system audio
-        # via ScreenCaptureKit (even though we do NOT record any video).
-        if (
-            sys_enabled
-            and (not self._systemaudio_permission_hint_shown)
-            and platform.system() == "Darwin"
-            and (not self._has_systemaudio_permission())
-        ):
-            self._systemaudio_permission_hint_shown = True
-            try:
-                messagebox.showinfo(
-                    "Systemaudio (macOS Berechtigung)",
-                    "macOS koppelt die Aufnahme von Systemaudio an die Berechtigung\n"
-                    "\"Bildschirm- & Systemaudioaufnahme\".\n\n"
-                    "Der Tscriba Recorder speichert KEIN Bildschirmvideo – nur Systemaudio.\n\n"
-                    "Bitte erlaube den Zugriff unter:\n"
-                    "Systemeinstellungen → Datenschutz & Sicherheit → Bildschirm- & Systemaudioaufnahme",
-                )
-            except Exception:
-                pass
+        # One-time hint for macOS system audio permission (backend-specific).
+        if sys_enabled and (not self._systemaudio_permission_hint_shown) and platform.system() == "Darwin":
+            backend = self._current_system_audio_backend()
+            needs_hint = (backend == SYSTEM_AUDIO_BACKEND_COREAUDIO) or (not self._has_systemaudio_permission())
+            if needs_hint:
+                self._systemaudio_permission_hint_shown = True
+                try:
+                    messagebox.showinfo(
+                        "Systemaudio (macOS Berechtigung)",
+                        system_audio_permission_hint_message(backend),
+                    )
+                except Exception:
+                    pass
 
         self.on_device_change()
         self._sync_record_buttons()
@@ -3003,11 +2938,28 @@ class TscribaRecorderApp(ctk.CTk):
     def start_test_mode(self):
         if self.rec.is_running or self._sys_only_running:
             return
+        self._reset_silence_autostop_state()
 
         mic_enabled = bool(self.rec_mic_var.get())
         sys_enabled = bool(self.rec_sys_var.get())
+        try:
+            self._log_line(
+                f"[debug] Start Test requested: mic={mic_enabled} sys={sys_enabled} backend={self._current_system_audio_backend()}"
+            )
+        except Exception:
+            pass
         if (not mic_enabled) and (not sys_enabled):
             return
+        if sys_enabled and self._current_system_audio_backend() == SYSTEM_AUDIO_BACKEND_COREAUDIO:
+            ok, reason = self._coreaudio_backend_supported_here()
+            if not ok:
+                try:
+                    self._log_line(f"[debug] Core Audio taps blocked: {reason}")
+                    self.status_var.set(reason)
+                    messagebox.showerror("Core Audio taps", reason)
+                except Exception:
+                    pass
+                return
 
         self._level_db = -120.0
         self._sys_level_db = -120.0
@@ -3046,9 +2998,10 @@ class TscribaRecorderApp(ctk.CTk):
                 self._test_sys_helper = SystemAudioHelper(
                     wav_path=None,
                     sample_rate=int(self.sr_var.get() or 48000),
-                    status_cb=lambda s: self.after(0, lambda: self.status_var.set(s)),
+                    status_cb=self.on_status,
                     level_cb=self.on_sys_level,
                     no_write=True,
+                    backend=self._current_system_audio_backend(),
                 )
                 self._test_sys_helper.start()
             except Exception as e:
@@ -3083,6 +3036,7 @@ class TscribaRecorderApp(ctk.CTk):
     def stop_test_mode(self):
         if not self._test_running:
             return
+        self._reset_silence_autostop_state()
 
         if self._test_mic_stream is not None:
             try:
@@ -3121,11 +3075,28 @@ class TscribaRecorderApp(ctk.CTk):
     def start_recording(self):
         if self._test_running:
             return
+        self._reset_silence_autostop_state()
         # Allow recording if either mic and/or system is selected.
         mic_enabled = bool(self.rec_mic_var.get())
         sys_enabled = bool(self.rec_sys_var.get())
+        try:
+            self._log_line(
+                f"[debug] Record requested: mic={mic_enabled} sys={sys_enabled} backend={self._current_system_audio_backend()}"
+            )
+        except Exception:
+            pass
         if (not mic_enabled) and (not sys_enabled):
             return
+        if sys_enabled and self._current_system_audio_backend() == SYSTEM_AUDIO_BACKEND_COREAUDIO:
+            ok, reason = self._coreaudio_backend_supported_here()
+            if not ok:
+                try:
+                    self._log_line(f"[debug] Core Audio taps blocked: {reason}")
+                    self.status_var.set(reason)
+                    messagebox.showerror("Core Audio taps", reason)
+                except Exception:
+                    pass
+                return
 
         # Prevent double-start: mic recorder or system-only helper already running
         if self.rec.is_running or self._sys_only_running:
@@ -3181,8 +3152,9 @@ class TscribaRecorderApp(ctk.CTk):
                 self.sys_helper = SystemAudioHelper(
                     sys_out_path,
                     sample_rate=int(self.sr_var.get() or 48000),
-                    status_cb=lambda s: self.after(0, lambda: self.status_var.set(s)),
+                    status_cb=self.on_status,
                     level_cb=self.on_sys_level,
+                    backend=self._current_system_audio_backend(),
                 )
                 self.sys_helper.start()
                 self._set_sys_audio_tap()
@@ -3242,6 +3214,7 @@ class TscribaRecorderApp(ctk.CTk):
         # lock UI during recording (mic and/or system)
         self._record_elapsed_total = 0.0
         self._record_started_at = time.monotonic()
+        self._silence_grace_until = time.monotonic() + 2.0
         self._record_timer_var.set("00:00:00")
         self.btn_record.configure(state="disabled")
         # Pause only supported for mic (for now)
@@ -3281,12 +3254,15 @@ class TscribaRecorderApp(ctk.CTk):
         if self.rec.is_paused:
             self.rec.resume()
             self._record_started_at = time.monotonic()
+            self._reset_silence_autostop_state()
+            self._silence_grace_until = time.monotonic() + 1.0
             self.btn_pause.configure(text="Pause")
         else:
             self.rec.pause()
             if self._record_started_at is not None:
                 self._record_elapsed_total += max(0.0, time.monotonic() - self._record_started_at)
             self._record_started_at = None
+            self._reset_silence_autostop_state()
             self.btn_pause.configure(text="Resume")
         self._sync_record_buttons()
         self._set_levels_visible(self._is_recording_or_paused())
@@ -3297,6 +3273,7 @@ class TscribaRecorderApp(ctk.CTk):
             return
         if (not self.rec.is_running) and (not self._sys_only_running) and (self.sys_helper is None or not self.sys_helper.is_running):
             return
+        self._reset_silence_autostop_state()
 
         # Stop mic first
         try:
@@ -3506,23 +3483,28 @@ class TscribaRecorderApp(ctk.CTk):
             except Exception:
                 pass
 
-            # Provide a helpful, explicit message if macOS denied ScreenCaptureKit permission.
-            # Typical helper stderr: "Failed: ... SCStreamErrorDomain Code=-3801 ... TCC ... abgelehnt"
+            # Provide a helpful, explicit message if macOS denied system-audio permission.
             if (
                 (not self._systemaudio_permission_denied_shown)
                 and platform.system() == "Darwin"
-                and ("SCStreamErrorDomain" in text or "TCC" in text)
-                and ("-3801" in text or "abgelehnt" in text.lower() or "denied" in text.lower())
+                and (
+                    ("SCStreamErrorDomain" in text)
+                    or ("TCC" in text)
+                    or ("permission" in text.lower())
+                    or ("not permitted" in text.lower())
+                )
+                and (
+                    ("-3801" in text)
+                    or ("abgelehnt" in text.lower())
+                    or ("denied" in text.lower())
+                    or ("not permitted" in text.lower())
+                )
             ):
                 self._systemaudio_permission_denied_shown = True
                 try:
                     messagebox.showerror(
                         "Systemaudio: Zugriff verweigert",
-                        "macOS hat die Berechtigung für \"Bildschirm- & Systemaudioaufnahme\" verweigert.\n\n"
-                        "Der Tscriba Recorder speichert KEIN Bildschirmvideo – nur Systemaudio.\n\n"
-                        "Bitte aktiviere den Zugriff unter:\n"
-                        "Systemeinstellungen → Datenschutz & Sicherheit → Bildschirm- & Systemaudioaufnahme\n\n"
-                        "Danach Tscriba Recorder neu starten.",
+                        system_audio_permission_denied_message(self._current_system_audio_backend()),
                     )
                 except Exception:
                     pass
@@ -3552,6 +3534,7 @@ class TscribaRecorderApp(ctk.CTk):
 
         self._update_record_timer()
         self._update_echo_state()
+        self._evaluate_silence_autostop()
 
         self.after(50, self._tick_ui)
 
@@ -4358,6 +4341,84 @@ class TscribaRecorderApp(ctk.CTk):
                     self._enable_aec(int(self.sr_var.get() or 48000))
                 except Exception:
                     pass
+
+    def _on_silence_autostop_toggle(self):
+        enabled = bool(self.auto_stop_on_silence_var.get())
+        try:
+            self._spin_set_state(self.silence_threshold_spin, "normal" if enabled else "disabled")
+            self._spin_set_state(self.silence_duration_spin, "normal" if enabled else "disabled")
+        except Exception:
+            pass
+        if not enabled:
+            self._reset_silence_autostop_state()
+
+    def _reset_silence_autostop_state(self):
+        self._silence_started_at = None
+        self._silence_autostop_triggered = False
+        self._silence_grace_until = 0.0
+
+    def _evaluate_silence_autostop(self):
+        if self._test_running:
+            return
+        if not self._is_recording_or_paused():
+            self._reset_silence_autostop_state()
+            return
+        if bool(getattr(self.rec, "is_paused", False)):
+            self._reset_silence_autostop_state()
+            return
+        if not bool(self.auto_stop_on_silence_var.get()):
+            self._reset_silence_autostop_state()
+            return
+        if self._silence_autostop_triggered:
+            return
+
+        now = time.monotonic()
+        if now < float(getattr(self, "_silence_grace_until", 0.0) or 0.0):
+            return
+
+        active_levels = []
+        if bool(self.rec_mic_var.get()):
+            active_levels.append(float(self._level_db))
+        if bool(self.rec_sys_var.get()):
+            active_levels.append(float(self._sys_level_db))
+        if not active_levels:
+            self._reset_silence_autostop_state()
+            return
+
+        try:
+            threshold_db = float(self.silence_threshold_db_var.get() or -55.0)
+        except Exception:
+            threshold_db = -55.0
+        try:
+            silence_duration = float(self.silence_duration_seconds_var.get() or 8.0)
+        except Exception:
+            silence_duration = 8.0
+        threshold_db = max(-120.0, min(0.0, threshold_db))
+        silence_duration = max(1.0, min(3600.0, silence_duration))
+
+        all_silent = all(level <= threshold_db for level in active_levels)
+        if not all_silent:
+            self._silence_started_at = None
+            return
+
+        if self._silence_started_at is None:
+            self._silence_started_at = now
+            return
+        if (now - float(self._silence_started_at)) < silence_duration:
+            return
+
+        self._silence_autostop_triggered = True
+        try:
+            self._log_line(
+                f"Auto-stop triggered: silence for {silence_duration:.1f}s at <= {threshold_db:.1f} dBFS on active inputs."
+            )
+            self.status_var.set("Auto-stop: keine Audiosignale erkannt.")
+        except Exception:
+            pass
+        try:
+            self.stop_recording()
+        except Exception:
+            pass
 
     def _update_echo_state(self):
         if not self._is_recording_or_paused():
