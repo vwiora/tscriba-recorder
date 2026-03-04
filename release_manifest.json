@@ -1,0 +1,14 @@
+{
+  "apps": {
+    "transcriba-transcription-manager": {
+      "versions": {
+        "default": "0.0.0"
+      }
+    },
+    "transcriba-audio-recorder": {
+      "versions": {
+        "default": "1.0.1"
+      }
+    }
+  }
+}

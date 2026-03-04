@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_dynamic_libs
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('transcriba_theme.json', '.'), ('assets', 'assets')]
+datas = [('transcriba_theme.json', '.'), ('assets', 'assets'), ('release_manifest.json', '.')]
 binaries = []
 hiddenimports = ['pystray._darwin']
 binaries += collect_dynamic_libs('ctranslate2')

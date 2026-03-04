@@ -9,6 +9,7 @@ import wave
 import threading
 import queue
 import time
+import webbrowser
 from typing import Optional, Callable
 from pathlib import Path
 import tkinter as tk
@@ -51,6 +52,13 @@ from audio_recorder import (
     TscribaRecorderConfig,
     list_input_devices,
     get_device_max_input_channels,
+)
+from versioning import (
+    APP_SLUG_AUDIO_RECORDER,
+    check_for_update,
+    detect_os_slug,
+    fallback_download_url,
+    resolve_version_from_manifest,
 )
 
 def _theme_path():
@@ -115,6 +123,9 @@ BUTTON_BG = ("#cfe8c9", "#2f3a33")
 BUTTON_HOVER_BG = ("#2e7d32", "#3f8f5a")
 BUTTON_TEXT = ("#2e7d32", "#cfe8c9")
 BUTTON_TEXT_HOVER = ("#ffffff", "#ffffff")
+CHECKBOX_SELECTED_BG = ("#2CC985", "#2FA572")
+CHECKBOX_SELECTED_HOVER = ("#0C955A", "#106A43")
+CHECKBOX_BORDER = ("#3E454A", "#949A9F")
 LOGO_MAX_SIZE = (180, 60)
 
 
@@ -923,6 +934,10 @@ class FasterWhisperMicTranscriber:
 class TscribaRecorderApp(ctk.CTk):
     def __init__(self):
         super().__init__()
+        try:
+            self.withdraw()
+        except Exception:
+            pass
 
         # ---- Window basics ----
         self.title("Transcriba")
@@ -931,7 +946,6 @@ class TscribaRecorderApp(ctk.CTk):
             self.configure(fg_color=BG_MAIN)
         except Exception:
             pass
-        self._center_window(1024, 720)
 
         # IMPORTANT: set scaling on THIS root (no second Tk window!)
         try:
@@ -951,6 +965,17 @@ class TscribaRecorderApp(ctk.CTk):
         self._test_running = False
         self._test_mic_stream = None
         self._test_sys_helper = None
+        self.app_slug = APP_SLUG_AUDIO_RECORDER
+        self.os_slug = detect_os_slug()
+        self.app_version = resolve_version_from_manifest(
+            app_slug=self.app_slug,
+            os_slug=self.os_slug,
+            bundle_dir=self._bundle_dir(),
+        )
+        self.version_label_var = tk.StringVar(value=f"Version: {self.app_version}")
+        self.update_status_var = tk.StringVar(value="")
+        self.update_download_url = fallback_download_url()
+        self._update_check_inflight = False
 
         # --- Live transcription UI (Mic only: faster-whisper, Schritt 1) ---
         self.live_transcription_var = tk.BooleanVar(value=False)
@@ -964,7 +989,6 @@ class TscribaRecorderApp(ctk.CTk):
         self.appearance_mode = tk.StringVar(value="System")
         self.recordings_root_var = tk.StringVar(value=default_recordings_dir())
         self.system_audio_backend_var = tk.StringVar(value=SYSTEM_AUDIO_BACKEND_LABELS[SYSTEM_AUDIO_BACKEND_SCK])
-        self.auto_small_on_recording_var = tk.BooleanVar(value=False)
         self.auto_stop_on_silence_var = tk.BooleanVar(value=False)
         self.silence_threshold_db_var = tk.DoubleVar(value=-55.0)
         self.silence_duration_seconds_var = tk.DoubleVar(value=8.0)
@@ -1021,6 +1045,7 @@ class TscribaRecorderApp(ctk.CTk):
 
         # ---- UI ----
         self._build_ui()
+        self.after(0, self._reveal_main_window)
 
         # Tray/menu bar controls (delayed & safe start for macOS)
         self.tray = None
@@ -1036,6 +1061,7 @@ class TscribaRecorderApp(ctk.CTk):
         self.after(100, self._process_ipc)
 
         self.after(50, self._tick_ui)
+        self.after(2200, self._startup_silent_update_check)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ------------------------------------------------------------------
@@ -1067,6 +1093,97 @@ class TscribaRecorderApp(ctk.CTk):
     def _legacy_settings_path(self):
         return os.path.join(self._bundle_dir(), "recorder_settings.json")
 
+    def _set_update_status(self, text: str):
+        try:
+            self.update_status_var.set(str(text or ""))
+        except Exception:
+            pass
+
+    def _startup_silent_update_check(self):
+        self._trigger_update_check(silent=True)
+
+    def _on_manual_update_check(self):
+        self._trigger_update_check(silent=False)
+
+    def _trigger_update_check(self, silent: bool):
+        if self._update_check_inflight:
+            if not silent:
+                messagebox.showinfo("Update-Check", "Update-Prüfung läuft bereits.")
+            return
+        self._update_check_inflight = True
+        try:
+            self.btn_check_updates.configure(state="disabled")
+        except Exception:
+            pass
+        self._set_update_status("Suche nach Updates...")
+        worker = threading.Thread(
+            target=self._run_update_check_worker,
+            args=(silent,),
+            daemon=True,
+            name="update_check",
+        )
+        worker.start()
+
+    def _run_update_check_worker(self, silent: bool):
+        result = check_for_update(
+            app_slug=self.app_slug,
+            os_slug=self.os_slug,
+            current_version=self.app_version,
+        )
+        self.after(0, lambda r=result, s=silent: self._apply_update_check_result(r, s))
+
+    def _apply_update_check_result(self, result, silent: bool):
+        self._update_check_inflight = False
+        try:
+            self.btn_check_updates.configure(state="normal")
+        except Exception:
+            pass
+        if result.download_url:
+            self.update_download_url = result.download_url
+
+        if result.error:
+            self._set_update_status("Update-Prüfung fehlgeschlagen.")
+            self.on_status(f"Update-Prüfung fehlgeschlagen: {result.error}")
+            if not silent:
+                messagebox.showerror(
+                    "Update-Check",
+                    f"Update-Prüfung fehlgeschlagen.\n\n{result.error}",
+                )
+            return
+
+        latest = result.latest_version or "unbekannt"
+        if result.update_available:
+            self._set_update_status(f"Update verfügbar: {result.current_version} -> {latest}")
+            if not silent:
+                open_download = messagebox.askyesno(
+                    "Update verfügbar",
+                    (
+                        f"Es ist eine neue Version verfügbar.\n\n"
+                        f"Aktuell: {result.current_version}\n"
+                        f"Neu: {latest}\n\n"
+                        f"Download-Seite jetzt öffnen?"
+                    ),
+                )
+                if open_download:
+                    self._open_download_page()
+            return
+
+        self._set_update_status(f"Aktuell: {result.current_version} (kein Update verfügbar)")
+        if not silent:
+            messagebox.showinfo(
+                "Update-Check",
+                f"Die App ist aktuell.\n\nVersion: {result.current_version}",
+            )
+
+    def _open_download_page(self):
+        url = (self.update_download_url or "").strip() or fallback_download_url()
+        try:
+            opened = webbrowser.open(url)
+            if not opened:
+                raise RuntimeError("Browser konnte nicht geöffnet werden.")
+        except Exception as exc:
+            messagebox.showerror("Download-Seite", f"Download-Seite konnte nicht geöffnet werden.\n\n{exc}")
+
     def _center_window(self, w: int, h: int):
         try:
             self.update_idletasks()
@@ -1075,6 +1192,20 @@ class TscribaRecorderApp(ctk.CTk):
             x = max(0, (sw - w) // 2)
             y = max(0, (sh - h) // 2)
             self.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
+    def _reveal_main_window(self):
+        try:
+            self._center_window(1024, 720)
+        except Exception:
+            pass
+        try:
+            self.deiconify()
+        except Exception:
+            return
+        try:
+            self.lift()
         except Exception:
             pass
 
@@ -1127,7 +1258,6 @@ class TscribaRecorderApp(ctk.CTk):
             self.recordings_root_var.set(str(data.get("recordings_root", self.recordings_root_var.get() or default_recordings_dir())))
             backend = _normalize_system_audio_backend(data.get("system_audio_backend", SYSTEM_AUDIO_BACKEND_SCK))
             self.system_audio_backend_var.set(SYSTEM_AUDIO_BACKEND_LABELS.get(backend, SYSTEM_AUDIO_BACKEND_LABELS[SYSTEM_AUDIO_BACKEND_SCK]))
-            self.auto_small_on_recording_var.set(bool(data.get("auto_small_on_recording", self.auto_small_on_recording_var.get())))
             self.auto_stop_on_silence_var.set(bool(data.get("auto_stop_on_silence", self.auto_stop_on_silence_var.get())))
             self.silence_threshold_db_var.set(float(data.get("silence_threshold_db", self.silence_threshold_db_var.get() or -55.0)))
             self.silence_duration_seconds_var.set(float(data.get("silence_duration_seconds", self.silence_duration_seconds_var.get() or 8.0)))
@@ -1182,7 +1312,6 @@ class TscribaRecorderApp(ctk.CTk):
             "aec_enabled": bool(self.aec_enabled_var.get()),
             "recordings_root": str(self.recordings_root_var.get() or ""),
             "system_audio_backend": _normalize_system_audio_backend(self.system_audio_backend_var.get()),
-            "auto_small_on_recording": bool(self.auto_small_on_recording_var.get()),
             "auto_stop_on_silence": bool(self.auto_stop_on_silence_var.get()),
             "silence_threshold_db": float(silence_threshold),
             "silence_duration_seconds": float(silence_duration),
@@ -1300,110 +1429,8 @@ class TscribaRecorderApp(ctk.CTk):
                 self._tab_button_defaults[name] = {"fg_color": None, "text_color": None}
             row += 1
 
-        self.compact_panel = ctk.CTkFrame(sidebar, fg_color=SIDEBAR_BG, corner_radius=8)
-        self.compact_panel.grid(row=90, column=0, sticky="nsew", padx=PAD, pady=(PAD, 0))
-        self.compact_panel.grid_remove()
-        self.compact_panel.grid_columnconfigure(0, weight=1)
-        self.compact_panel.grid_rowconfigure(2, weight=1)
-
-        compact_btn_row = ctk.CTkFrame(self.compact_panel, fg_color="transparent", corner_radius=0)
-        compact_btn_row.grid(row=0, column=0, sticky="ew")
-        compact_btn_row.grid_columnconfigure((0, 1, 2), weight=1)
-
-        compact_h = max(28, CONTROL_HEIGHT - 8)
-        compact_font = _font(max(12, FONT_BASE - 2))
-        self.btn_record_compact = ctk.CTkButton(
-            compact_btn_row, text="Play", command=self.start_recording, font=compact_font, height=compact_h
-        )
-        _style_button(self.btn_record_compact)
-        self.btn_record_compact.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-
-        self.btn_pause_compact = ctk.CTkButton(
-            compact_btn_row, text="Pause", command=self.toggle_pause, font=compact_font, height=compact_h
-        )
-        _style_button(self.btn_pause_compact)
-        self.btn_pause_compact.grid(row=0, column=1, sticky="ew", padx=2)
-
-        self.btn_stop_compact = ctk.CTkButton(
-            compact_btn_row, text="Stop", command=self.stop_recording, font=compact_font, height=compact_h
-        )
-        _style_button(self.btn_stop_compact)
-        self.btn_stop_compact.grid(row=0, column=2, sticky="ew", padx=(4, 0))
-
-        compact_levels = ctk.CTkFrame(self.compact_panel, fg_color="transparent", corner_radius=0)
-        compact_levels.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        compact_levels.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(compact_levels, text="Mic", font=_font(FONT_BASE)).grid(row=0, column=0, sticky="w")
-        self.level_mic_compact = ctk.CTkProgressBar(compact_levels)
-        self.level_mic_compact.set(0)
-        self.level_mic_compact.grid(row=1, column=0, sticky="ew")
-        ctk.CTkLabel(compact_levels, text="System", font=_font(FONT_BASE)).grid(row=2, column=0, sticky="w", pady=(4, 0))
-        self.level_sys_compact = ctk.CTkProgressBar(compact_levels)
-        self.level_sys_compact.set(0)
-        self.level_sys_compact.grid(row=3, column=0, sticky="ew")
-
-        self._compact_transcript_text = ctk.CTkTextbox(self.compact_panel, wrap="word", font=_font(FONT_BASE))
-        _style_textbox(self._compact_transcript_text)
-        self._compact_transcript_text.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
-        self._compact_transcript_text.configure(state="disabled")
-        _style_textbox_readonly(self._compact_transcript_text)
-
-        self._compact_controls = {
-            "record": self.btn_record_compact,
-            "pause": self.btn_pause_compact,
-            "stop": self.btn_stop_compact,
-        }
-
-        self._compact_view = False
-        self._full_geometry_before_compact = None
-        self._compact_fixed_width = None
-        self._enforcing_compact_window = False
-        self._compact_fullscreen_exit_in_progress = False
-        self._normal_window_minsize = None
-        self._normal_window_maxsize = None
-        self._normal_window_resizable = (True, True)
-        self.btn_toggle_view = ctk.CTkButton(
-            sidebar,
-            text="Kleine Ansicht",
-            width=180,
-            font=_font(size=FONT_BASE),
-            command=self._toggle_compact_view,
-        )
-        _style_button(self.btn_toggle_view)
-        self.btn_toggle_view.grid(row=95, column=0, sticky="ew", padx=PAD, pady=(PAD, 0))
-
-        self.btn_toggle_log = ctk.CTkButton(
-            sidebar,
-            text="Log anzeigen",
-            width=180,
-            font=_font(size=FONT_BASE),
-            command=self._toggle_log_panel,
-        )
-        _style_button(self.btn_toggle_log)
-        self.btn_toggle_log.grid(row=96, column=0, sticky="ew", padx=PAD, pady=PAD)
-
-
-        self.main_pane = tk.PanedWindow(
-            self,
-            orient=tk.HORIZONTAL,
-            sashrelief="raised",
-            sashwidth=6,
-            bd=0,
-            bg=_resolve_color(BG_MAIN),
-        )
-        self.main_pane.grid(row=0, column=1, sticky="nsew", pady=0)
-
         self.content_root = ctk.CTkFrame(self, corner_radius=0, fg_color=BG_MAIN)
-        self.log_root = ctk.CTkFrame(self, corner_radius=0, fg_color=BG_MAIN)
-        self.main_pane.add(self.content_root, minsize=480, padx=1)
-        self.main_pane.add(self.log_root, minsize=240)
-        self._log_collapsed = True
-        self._log_last_width = 400
-        self.main_pane.bind("<Configure>", lambda _e: self._ensure_log_width())
-        try:
-            self.main_pane.forget(self.log_root)
-        except Exception:
-            pass
+        self.content_root.grid(row=0, column=1, sticky="nsew", pady=0)
 
         self.content_root.grid_rowconfigure(0, weight=1)
         self.content_root.grid_columnconfigure(0, weight=1)
@@ -1446,8 +1473,6 @@ class TscribaRecorderApp(ctk.CTk):
         self._build_transcript_tab(self._tab_bodies["Live Transcript"])
         self._build_settings_tab(self._tab_bodies["Settings"])
 
-        self._build_log_panel()
-
         self._tab_disabled = set()
         self._set_tab_enabled("Live Transcript", bool(self.live_transcription_var.get()))
 
@@ -1455,10 +1480,7 @@ class TscribaRecorderApp(ctk.CTk):
         self.refresh_devices()
         self.on_mode_change()
 
-        self.after(0, self._ensure_log_width)
         self.after(0, self._sync_main_layout)
-        self.after(0, self._capture_default_window_constraints)
-        self.bind("<Configure>", self._on_window_configure, add="+")
 
     def _spin_set_state(self, spin, state):
         try:
@@ -1471,6 +1493,49 @@ class TscribaRecorderApp(ctk.CTk):
                 btn_up.configure(state=state)
             if btn_down is not None:
                 btn_down.configure(state=state)
+        except Exception:
+            pass
+
+    def _spin_set_visual_state(self, spin, enabled: bool, enabled_entry_bg=None):
+        try:
+            entry = getattr(spin, "_spin_entry", None)
+            btn_up = getattr(spin, "_spin_btn_up", None)
+            btn_down = getattr(spin, "_spin_btn_down", None)
+            entry_bg = enabled_entry_bg if (enabled and enabled_entry_bg is not None) else (
+                _resolve_color(ENTRY_BG) if enabled else _resolve_color(READONLY_BG)
+            )
+            if entry is not None:
+                try:
+                    entry.configure(
+                        fg_color=entry_bg,
+                        border_color=_resolve_color(ENTRY_BORDER),
+                        text_color=_resolve_color(ENTRY_TEXT),
+                    )
+                except Exception:
+                    pass
+            for btn in (btn_up, btn_down):
+                if btn is None:
+                    continue
+                if enabled:
+                    try:
+                        btn.configure(
+                            fg_color=_resolve_color(BUTTON_BG),
+                            hover_color=_resolve_color(BUTTON_HOVER_BG),
+                            text_color=_resolve_color(BUTTON_TEXT),
+                            border_color=_resolve_color(ENTRY_BORDER),
+                        )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        btn.configure(
+                            fg_color=_resolve_color(READONLY_BG),
+                            hover_color=_resolve_color(READONLY_BG),
+                            text_color="#8a8a8a",
+                            border_color=_resolve_color(ENTRY_BORDER),
+                        )
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -1773,24 +1838,64 @@ class TscribaRecorderApp(ctk.CTk):
         body.grid_columnconfigure(0, weight=1)
         body.grid_rowconfigure(2, weight=1)
 
-        settings_tabs = ctk.CTkTabview(body)
-        settings_tabs.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
-        try:
-            settings_tabs.configure(
-                fg_color=ENTRY_BG,
+        settings_tabs_shell = ctk.CTkFrame(body, fg_color=ENTRY_BG)
+        settings_tabs_shell.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
+        settings_tabs_shell.grid_columnconfigure(0, weight=1)
+        settings_tabs_shell.grid_rowconfigure(0, weight=0)
+        settings_tabs_shell.grid_rowconfigure(1, weight=1)
+
+        settings_tabs_bar = ctk.CTkFrame(settings_tabs_shell, fg_color="#ffffff")
+        settings_tabs_bar.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 0))
+
+        settings_tabs_content = ctk.CTkFrame(settings_tabs_shell, corner_radius=0, fg_color=ENTRY_BG, border_width=0)
+        settings_tabs_content.grid(row=1, column=0, sticky="nsew", padx=0, pady=(0, 0))
+        settings_tabs_content.grid_columnconfigure(0, weight=1)
+        settings_tabs_content.grid_rowconfigure(0, weight=1)
+
+        settings_tab_names = ["General", "Recordings", "Live-Transcripts", "Log"]
+        self._settings_tab_names = list(settings_tab_names)
+        self._settings_tab_buttons = {}
+        self._settings_tab_wrappers = {}
+        self._settings_tab_frames = {}
+        self._settings_tab_enabled = True
+        for i, name in enumerate(settings_tab_names):
+            wrap = ctk.CTkFrame(
+                settings_tabs_bar,
+                corner_radius=0,
+                fg_color="#e4e4e4",
                 border_width=1,
-                border_color=ENTRY_BORDER,
-                segmented_button_fg_color=ENTRY_BG,
-                segmented_button_font=_font(size=FONT_BASE),
-                segmented_button_height=42,
-                segmented_button_padding=5,
+                border_color="#e4e4e4",
             )
-        except Exception:
-            pass
-        self._style_tabview_buttons(settings_tabs)
+            wrap.grid(row=0, column=i, sticky="w", padx=(0, 0), pady=(0, 0))
+            wrap.grid_columnconfigure(0, weight=1)
+            wrap.grid_rowconfigure(0, weight=1)
+            btn = ctk.CTkButton(
+                wrap,
+                text=name,
+                font=_font(size=FONT_BASE),
+                width=180,
+                height=CONTROL_HEIGHT,
+                corner_radius=0,
+                border_width=0,
+                command=lambda n=name: self._select_settings_subtab(n),
+            )
+            btn.grid(row=0, column=0, sticky="nsew", padx=(1, 1), pady=(1, 0))
+            self._settings_tab_wrappers[name] = wrap
+            self._settings_tab_buttons[name] = btn
+
+            panel = ctk.CTkFrame(settings_tabs_content, corner_radius=0, fg_color=ENTRY_BG)
+            panel.grid(row=0, column=0, sticky="nsew")
+            panel.grid_remove()
+            self._settings_tab_frames[name] = panel
+
+        general_tab = self._settings_tab_frames["General"]
+        rec_tab = self._settings_tab_frames["Recordings"]
+        live_tab = self._settings_tab_frames["Live-Transcripts"]
+        log_tab = self._settings_tab_frames["Log"]
+        self._settings_current_tab = "General"
+        self._select_settings_subtab("General")
 
         # Recordings tab (3-column layout)
-        rec_tab = settings_tabs.add("Recordings")
         rec_tab.grid_rowconfigure(0, weight=1)
         rec_tab.grid_columnconfigure(0, weight=1, uniform="settings_rec")
         rec_tab.grid_columnconfigure(1, weight=1, uniform="settings_rec")
@@ -1828,8 +1933,19 @@ class TscribaRecorderApp(ctk.CTk):
         rec_col3 = ctk.CTkFrame(rec_tab, fg_color="transparent", corner_radius=0)
         rec_col3.grid(row=0, column=2, sticky="nsew", padx=(8, 0), pady=(0, 8))
 
+        r3e2 = ctk.CTkFrame(rec_col3, fg_color="transparent", corner_radius=0)
+        r3e2.pack(fill="x", padx=8, pady=(8, 8))
+        self.aec_chk = ctk.CTkCheckBox(
+            r3e2,
+            text="Echo Cancellation (AEC)",
+            variable=self.aec_enabled_var,
+            font=_font(FONT_BASE),
+            command=self._on_aec_toggle,
+        )
+        self.aec_chk.pack(anchor="w")
+
         r3e = ctk.CTkFrame(rec_col3, fg_color="transparent", corner_radius=0)
-        r3e.pack(fill="x", padx=8, pady=(8, 8))
+        r3e.pack(fill="x", padx=8, pady=(0, 8))
         self.auto_duck_chk = ctk.CTkCheckBox(
             r3e,
             text="Auto-duck Microphone",
@@ -1855,17 +1971,6 @@ class TscribaRecorderApp(ctk.CTk):
         except Exception:
             pass
         self.auto_duck_preset.pack(fill="x", pady=(4, 0))
-
-        r3e2 = ctk.CTkFrame(rec_col3, fg_color="transparent", corner_radius=0)
-        r3e2.pack(fill="x", padx=8, pady=(0, 8))
-        self.aec_chk = ctk.CTkCheckBox(
-            r3e2,
-            text="Echo Cancellation (AEC)",
-            variable=self.aec_enabled_var,
-            font=_font(FONT_BASE),
-            command=self._on_aec_toggle,
-        )
-        self.aec_chk.pack(anchor="w")
 
         r3h = ctk.CTkFrame(rec_col3, fg_color="transparent", corner_radius=0)
         r3h.pack(fill="x", padx=8, pady=(0, 8))
@@ -1907,7 +2012,6 @@ class TscribaRecorderApp(ctk.CTk):
         self.silence_duration_spin.pack(fill="x", pady=(4, 0))
 
         # Live-Transcripts tab (3-column layout)
-        live_tab = settings_tabs.add("Live-Transcripts")
         live_tab.grid_rowconfigure(0, weight=1)
         live_tab.grid_columnconfigure(0, weight=1, uniform="settings_live")
         live_tab.grid_columnconfigure(1, weight=1, uniform="settings_live")
@@ -1987,7 +2091,6 @@ class TscribaRecorderApp(ctk.CTk):
         self._transcription_controls.append(vad_chk)
 
         # General tab (single-column layout)
-        general_tab = settings_tabs.add("General")
         general_tab.grid_rowconfigure(0, weight=1)
         general_tab.grid_columnconfigure(0, weight=1)
 
@@ -2025,18 +2128,8 @@ class TscribaRecorderApp(ctk.CTk):
         _style_button(btn_root)
         btn_root.pack(side="right")
 
-        r7d = ctk.CTkFrame(sec3, fg_color="transparent", corner_radius=0)
-        r7d.pack(fill="x", padx=8, pady=(0, 8))
-        auto_small_chk = ctk.CTkCheckBox(
-            r7d,
-            text="Kleine Anzeige während Recordings einschalten",
-            variable=self.auto_small_on_recording_var,
-            font=_font(FONT_BASE),
-        )
-        auto_small_chk.pack(anchor="w")
-
         r7e = ctk.CTkFrame(sec3, fg_color="transparent", corner_radius=0)
-        r7e.pack(fill="x", padx=8, pady=(0, 8))
+        r7e.pack(fill="x", padx=8, pady=(8, 8))
         ctk.CTkLabel(r7e, text="System Audio Backend", font=_font(FONT_BASE)).pack(anchor="w")
         backend_menu = ctk.CTkComboBox(
             r7e,
@@ -2049,6 +2142,94 @@ class TscribaRecorderApp(ctk.CTk):
         _style_entry(backend_menu)
         backend_menu.pack(fill="x", pady=(4, 0))
 
+        r7f = ctk.CTkFrame(sec3, fg_color="transparent", corner_radius=0)
+        r7f.pack(fill="x", padx=8, pady=(8, 4))
+        ctk.CTkLabel(r7f, textvariable=self.version_label_var, font=_font(FONT_BASE)).pack(anchor="w")
+
+        r7g = ctk.CTkFrame(sec3, fg_color="transparent", corner_radius=0)
+        r7g.pack(fill="x", padx=8, pady=(0, 8))
+        self.btn_check_updates = ctk.CTkButton(
+            r7g,
+            text="Nach Updates suchen",
+            font=_font(FONT_BASE),
+            height=CONTROL_HEIGHT,
+            command=self._on_manual_update_check,
+        )
+        _style_button(self.btn_check_updates)
+        self.btn_check_updates.pack(side="left")
+        self.btn_open_download = ctk.CTkButton(
+            r7g,
+            text="Download-Seite öffnen",
+            font=_font(FONT_BASE),
+            height=CONTROL_HEIGHT,
+            command=self._open_download_page,
+        )
+        _style_button(self.btn_open_download)
+        self.btn_open_download.pack(side="left", padx=(8, 0))
+
+        r7h = ctk.CTkFrame(sec3, fg_color="transparent", corner_radius=0)
+        r7h.pack(fill="x", padx=8, pady=(0, 8))
+        ctk.CTkLabel(r7h, textvariable=self.update_status_var, font=_font(FONT_BASE)).pack(anchor="w")
+
+        # Log tab (single-column layout)
+        log_tab.grid_rowconfigure(0, weight=1)
+        log_tab.grid_columnconfigure(0, weight=1)
+
+        card_log = ctk.CTkFrame(log_tab, corner_radius=16, fg_color=ENTRY_BG)
+        card_log.grid(row=0, column=0, sticky="nsew", padx=PAD, pady=PAD)
+        card_log.grid_rowconfigure(1, weight=1)
+        card_log.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            card_log,
+            text="Log",
+            font=_font(size=FONT_BASE),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=PAD, pady=PAD)
+
+        self.log = ctk.CTkTextbox(card_log, wrap="word")
+        _style_textbox(self.log)
+        self.log.grid(row=1, column=0, sticky="nsew", padx=PAD, pady=PAD)
+        self.log.configure(state="disabled")
+        _style_textbox_readonly(self.log)
+
+        bottom_bar = ctk.CTkFrame(log_tab, corner_radius=0, fg_color=ENTRY_BG)
+        bottom_bar.grid(row=1, column=0, sticky="ew", padx=PAD, pady=(0, PAD))
+        bottom_bar.grid_columnconfigure(0, weight=1)
+        bottom_bar.grid_columnconfigure(1, weight=0)
+        bottom_bar.grid_columnconfigure(2, weight=0)
+        bottom_bar.grid_columnconfigure(3, weight=0)
+        self.btn_copy_log = ctk.CTkButton(
+            bottom_bar,
+            text="Kopieren",
+            font=_font(size=FONT_BASE),
+            anchor="w",
+            width=94,
+            command=self.copy_log,
+        )
+        _style_button(self.btn_copy_log)
+        self.btn_copy_log.grid(row=0, column=1, sticky="e", padx=(0, PAD))
+        self.btn_save_log = ctk.CTkButton(
+            bottom_bar,
+            text="Speichern",
+            font=_font(size=FONT_BASE),
+            anchor="w",
+            width=94,
+            command=self.save_log,
+        )
+        _style_button(self.btn_save_log)
+        self.btn_save_log.grid(row=0, column=2, sticky="e", padx=(0, PAD))
+        self.btn_clear = ctk.CTkButton(
+            bottom_bar,
+            text="Löschen",
+            font=_font(size=FONT_BASE),
+            anchor="w",
+            width=94,
+            command=self.clear_log,
+        )
+        _style_button(self.btn_clear)
+        self.btn_clear.grid(row=0, column=3, sticky="e")
+
         btn_label = "Aktualisieren" if self._settings_loaded else "Speichern"
         self._btn_save_settings = ctk.CTkButton(
             body, text=btn_label, font=_font(FONT_BASE), height=CONTROL_HEIGHT, command=self._save_settings
@@ -2056,29 +2237,125 @@ class TscribaRecorderApp(ctk.CTk):
         _style_button(self._btn_save_settings)
         self._btn_save_settings.grid(row=3, column=0, sticky="e", pady=(6, 0))
 
-        try:
-            settings_tabs.set("Recordings")
-        except Exception:
-            pass
+        self._select_settings_subtab("General")
         self._on_silence_autostop_toggle()
 
         self._set_transcription_settings_enabled(
             bool(self.live_transcription_var.get()) and (bool(self.rec_mic_var.get()) or bool(self.rec_sys_var.get()))
         )
+        self._style_settings_controls_white()
+        self._on_auto_duck_toggle()
 
-    def _style_tabview_buttons(self, tabs):
-        try:
-            sb = getattr(tabs, "_segmented_button", None)
-            if sb is None:
-                return
-            buttons = getattr(sb, "_buttons_dict", {}) or {}
-            for btn in buttons.values():
-                try:
-                    btn.configure(border_spacing=5, font=_font(size=FONT_BASE))
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    def _style_settings_subtabs_card(self):
+        active = str(getattr(self, "_settings_current_tab", "") or "")
+        enabled = bool(getattr(self, "_settings_tab_enabled", True))
+        names = list(getattr(self, "_settings_tab_names", []) or [])
+        active_index = names.index(active) if active in names else -1
+        for name, btn in (getattr(self, "_settings_tab_buttons", {}) or {}).items():
+            wrap = (getattr(self, "_settings_tab_wrappers", {}) or {}).get(name)
+            idx = names.index(name) if name in names else -1
+            is_active = name == active
+            try:
+                if is_active:
+                    if wrap is not None:
+                        wrap.configure(border_width=0, fg_color=ENTRY_BG, border_color=ENTRY_BG)
+                    btn.configure(
+                        state="normal" if enabled else "disabled",
+                        fg_color=ENTRY_BG,
+                        hover_color=ENTRY_BG,
+                        text_color=ENTRY_TEXT,
+                        border_width=0,
+                        corner_radius=0,
+                    )
+                    btn.grid_configure(padx=(0, 0), pady=(0, 0))
+                else:
+                    if wrap is not None:
+                        wrap.configure(border_width=1, fg_color="#e4e4e4", border_color="#e4e4e4")
+                    btn.configure(
+                        state="normal" if enabled else "disabled",
+                        fg_color="#ffffff",
+                        hover_color="#f6f6f6",
+                        text_color=_resolve_color(TAB_TEXT_INACTIVE) if enabled else _resolve_color(TAB_TEXT_DISABLED),
+                        border_width=0,
+                        corner_radius=0,
+                    )
+                    if active_index >= 0 and idx >= 0:
+                        if idx < active_index:
+                            btn.grid_configure(padx=(1, 0), pady=(1, 0))
+                        else:
+                            btn.grid_configure(padx=(0, 1), pady=(1, 0))
+                    else:
+                        btn.grid_configure(padx=(1, 1), pady=(1, 0))
+            except Exception:
+                pass
+
+    def _select_settings_subtab(self, name: str):
+        frames = getattr(self, "_settings_tab_frames", {}) or {}
+        if name not in frames:
+            return
+        for tab_name, frame in frames.items():
+            try:
+                if tab_name == name:
+                    frame.grid()
+                else:
+                    frame.grid_remove()
+            except Exception:
+                pass
+        self._settings_current_tab = name
+        self._style_settings_subtabs_card()
+        self._style_settings_controls_white()
+
+    def _style_settings_controls_white(self):
+        frames = getattr(self, "_settings_tab_frames", {}) or {}
+        for frame in frames.values():
+            self._style_widget_tree_white(frame)
+
+    def _style_widget_tree_white(self, root):
+        if root is None:
+            return
+        stack = [root]
+        while stack:
+            widget = stack.pop()
+            try:
+                stack.extend(widget.winfo_children())
+            except Exception:
+                pass
+            try:
+                if isinstance(widget, ctk.CTkCheckBox):
+                    widget.configure(
+                        bg_color=ENTRY_BG,
+                        fg_color=CHECKBOX_SELECTED_BG,
+                        hover_color=CHECKBOX_SELECTED_HOVER,
+                        border_color=CHECKBOX_BORDER,
+                    )
+                elif isinstance(widget, (ctk.CTkComboBox, ctk.CTkOptionMenu, ctk.CTkEntry)):
+                    widget.configure(fg_color="#ffffff")
+                elif isinstance(widget, ctk.CTkTextbox):
+                    if widget is getattr(self, "log", None):
+                        widget.configure(
+                            fg_color=_resolve_color(ENTRY_BG),
+                            border_width=1,
+                            border_color=_resolve_color(ENTRY_BORDER),
+                        )
+                    else:
+                        widget.configure(
+                            fg_color="#ffffff",
+                            border_width=1,
+                            border_color=_resolve_color(ENTRY_BORDER),
+                        )
+                elif hasattr(widget, "_spin_entry"):
+                    spin_entry = getattr(widget, "_spin_entry", None)
+                    if spin_entry is not None:
+                        try:
+                            spin_state = str(spin_entry.cget("state") or "").lower()
+                        except Exception:
+                            spin_state = "normal"
+                        if spin_state == "disabled":
+                            spin_entry.configure(fg_color=_resolve_color(READONLY_BG))
+                        else:
+                            spin_entry.configure(fg_color="#ffffff")
+            except Exception:
+                pass
 
     def _add_record_controls(self, parent, label: str = "Recorder", pady=(10, 0)):
         row = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=0)
@@ -2114,9 +2391,6 @@ class TscribaRecorderApp(ctk.CTk):
         targets = []
         if ctrls:
             targets.append(ctrls)
-        compact_ctrls = getattr(self, "_compact_controls", None)
-        if compact_ctrls:
-            targets.append(compact_ctrls)
         if not targets:
             return
         for t in targets:
@@ -2126,85 +2400,6 @@ class TscribaRecorderApp(ctk.CTk):
                 t["pause"].configure(state=self.btn_pause.cget("state"), text=self.btn_pause.cget("text"))
             except Exception:
                 pass
-
-    def _build_log_panel(self):
-        self.status_var = tk.StringVar(value="Ready.")
-
-        self.log_root.grid_rowconfigure(1, weight=1)
-        self.log_root.grid_rowconfigure(2, weight=0)
-        self.log_root.grid_columnconfigure(0, weight=1)
-
-        log_header = ctk.CTkFrame(self.log_root, corner_radius=12, fg_color=BG_MAIN)
-        log_header.grid(row=0, column=0, sticky="ew", pady=PAD)
-        log_header.grid_columnconfigure(1, weight=1)
-
-        self.status_label = ctk.CTkLabel(
-            log_header,
-            textvariable=self.status_var,
-            text_color="#666666",
-            font=_font(size=FONT_BASE),
-            anchor="w",
-        )
-        self.status_label.grid(row=0, column=0, sticky="w", padx=PAD, pady=PAD)
-
-        self.progress = ctk.CTkProgressBar(log_header)
-        self.progress.set(0)
-        self.progress.grid(row=0, column=1, sticky="ew", padx=PAD, pady=PAD)
-
-        card_log = ctk.CTkFrame(self.log_root, corner_radius=16, fg_color=BG_MAIN)
-        card_log.grid(row=1, column=0, sticky="nsew")
-        card_log.grid_rowconfigure(1, weight=1)
-        card_log.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(
-            card_log,
-            text="Log",
-            font=_font(size=FONT_BASE),
-            anchor="w",
-        ).grid(row=0, column=0, sticky="w", padx=PAD, pady=PAD)
-
-        self.log = ctk.CTkTextbox(card_log, wrap="word")
-        _style_textbox(self.log)
-        self.log.grid(row=1, column=0, sticky="nsew", padx=PAD, pady=PAD)
-        self.log.configure(state="disabled")
-        _style_textbox_readonly(self.log)
-
-        bottom_bar = ctk.CTkFrame(self.log_root, corner_radius=0, fg_color=BG_MAIN)
-        bottom_bar.grid(row=2, column=0, sticky="ew", padx=PAD, pady=PAD)
-        bottom_bar.grid_columnconfigure(0, weight=1)
-        bottom_bar.grid_columnconfigure(1, weight=0)
-        bottom_bar.grid_columnconfigure(2, weight=0)
-        bottom_bar.grid_columnconfigure(3, weight=0)
-        self.btn_copy_log = ctk.CTkButton(
-            bottom_bar,
-            text="Kopieren",
-            font=_font(size=FONT_BASE),
-            anchor="w",
-            width=94,
-            command=self.copy_log,
-        )
-        _style_button(self.btn_copy_log)
-        self.btn_copy_log.grid(row=0, column=1, sticky="e", padx=(0, PAD))
-        self.btn_save_log = ctk.CTkButton(
-            bottom_bar,
-            text="Speichern",
-            font=_font(size=FONT_BASE),
-            anchor="w",
-            width=94,
-            command=self.save_log,
-        )
-        _style_button(self.btn_save_log)
-        self.btn_save_log.grid(row=0, column=2, sticky="e", padx=(0, PAD))
-        self.btn_clear = ctk.CTkButton(
-            bottom_bar,
-            text="Löschen",
-            font=_font(size=FONT_BASE),
-            anchor="w",
-            width=94,
-            command=self.clear_log,
-        )
-        _style_button(self.btn_clear)
-        self.btn_clear.grid(row=0, column=3, sticky="e")
 
     def _select_tab(self, name: str):
         frame = self._tab_frames.get(name)
@@ -2301,323 +2496,30 @@ class TscribaRecorderApp(ctk.CTk):
             pass
 
     def _toggle_log_panel(self):
-        if self._log_collapsed:
-            self._log_collapsed = False
-        else:
-            try:
-                w = int(self.log_root.winfo_width() or 0)
-                if w > 0:
-                    self._log_last_width = w
-            except Exception:
-                pass
-            self._log_collapsed = True
-        self._refresh_log_toggle_label()
-        self._sync_main_layout()
-        if bool(getattr(self, "_compact_view", False)):
-            self._apply_compact_window_size(log_visible=(not self._log_collapsed))
-            self._apply_window_constraints_for_mode()
+        self._show_log_panel()
 
-    def _toggle_compact_view(self):
-        turning_on = not bool(getattr(self, "_compact_view", False))
-        if turning_on:
-            self._full_geometry_before_compact = self._current_window_geometry()
-        self._compact_view = turning_on
+    def _show_log_panel(self):
         try:
-            self.btn_toggle_view.configure(text=("Große Anzeige" if self._compact_view else "Kleine Ansicht"))
+            self._select_tab("Settings")
         except Exception:
             pass
-        self._refresh_log_toggle_label()
-        self._sync_main_layout()
-        if self._compact_view:
-            self._apply_compact_window_size(log_visible=(not self._log_collapsed))
-            self._apply_window_constraints_for_mode()
-        else:
-            self._restore_full_window_geometry()
-            self._apply_window_constraints_for_mode()
-
-    def _pane_has(self, pane) -> bool:
         try:
-            return str(pane) in set(self.main_pane.panes())
-        except Exception:
-            return False
-
-    def _set_tab_buttons_visible(self, visible: bool):
-        for btn in (self._tab_buttons or {}).values():
-            try:
-                if visible:
-                    btn.grid()
-                else:
-                    btn.grid_remove()
-            except Exception:
-                pass
-
-    def _set_compact_panel_visible(self, visible: bool):
-        panel = getattr(self, "compact_panel", None)
-        if panel is None:
-            return
-        try:
-            if visible:
-                panel.grid()
-                self._update_compact_transcript_visibility()
-            else:
-                panel.grid_remove()
-        except Exception:
-            pass
-
-    def _update_compact_transcript_visibility(self):
-        txt = getattr(self, "_compact_transcript_text", None)
-        if txt is None:
-            return
-        show = bool(self.live_transcription_var.get())
-        try:
-            if show:
-                txt.grid()
-            else:
-                txt.grid_remove()
-        except Exception:
-            pass
-
-    def _refresh_log_toggle_label(self):
-        try:
-            self.btn_toggle_log.configure(text=("Log anzeigen" if self._log_collapsed else "Log ausblenden"))
+            self._select_settings_subtab("Log")
         except Exception:
             pass
 
     def _sync_main_layout(self):
-        compact = bool(getattr(self, "_compact_view", False))
-        log_hidden = bool(getattr(self, "_log_collapsed", True))
-        self._refresh_log_toggle_label()
-        self._set_tab_buttons_visible(not compact)
-        self._set_compact_panel_visible(compact)
-
-        if compact and log_hidden:
-            try:
-                self.grid_columnconfigure(1, weight=0)
-            except Exception:
-                pass
-            try:
-                self.main_pane.grid_remove()
-            except Exception:
-                pass
-            return
-
         try:
-            self.main_pane.grid(row=0, column=1, sticky="nsew", pady=0)
-        except Exception:
-            pass
-
-        # Rebuild pane content deterministically to avoid stale splitbars/panes.
-        # Forget panes unconditionally; tk.PanedWindow can report pane lists inconsistently across transitions.
-        for pane in (self.content_root, self.log_root):
-            try:
-                self.main_pane.forget(pane)
-            except Exception:
-                pass
-
-        if compact:
-            try:
-                self.grid_columnconfigure(1, weight=1)
-            except Exception:
-                pass
-            if not log_hidden:
-                try:
-                    self.main_pane.add(self.log_root, minsize=240)
-                except Exception:
-                    pass
-        else:
-            try:
-                self.grid_columnconfigure(1, weight=1)
-            except Exception:
-                pass
-            try:
-                self.main_pane.add(self.content_root, minsize=480, padx=1)
-            except Exception:
-                pass
-            if not log_hidden:
-                try:
-                    self.main_pane.add(self.log_root, minsize=240)
-                except Exception:
-                    pass
-
-        if not log_hidden:
-            self._ensure_log_width()
-
-    def _current_window_geometry(self):
-        try:
-            self.update_idletasks()
-            return (
-                int(self.winfo_width()),
-                int(self.winfo_height()),
-                int(self.winfo_x()),
-                int(self.winfo_y()),
-            )
-        except Exception:
-            return None
-
-    def _set_window_geometry(self, w: int, h: int, x: int, y: int):
-        try:
-            self.geometry(f"{int(w)}x{int(h)}+{int(x)}+{int(y)}")
-        except Exception:
-            pass
-
-    def _capture_default_window_constraints(self):
-        try:
-            self._normal_window_minsize = tuple(map(int, self.minsize()))
-        except Exception:
-            self._normal_window_minsize = (1, 1)
-        try:
-            self._normal_window_maxsize = tuple(map(int, self.maxsize()))
-        except Exception:
-            self._normal_window_maxsize = (10_000, 10_000)
-        try:
-            rs = self.resizable()
-            if isinstance(rs, tuple) and len(rs) == 2:
-                self._normal_window_resizable = (bool(rs[0]), bool(rs[1]))
-        except Exception:
-            self._normal_window_resizable = (True, True)
-
-    def _force_exit_fullscreen_if_compact(self):
-        if not bool(getattr(self, "_compact_view", False)):
-            return
-        if bool(getattr(self, "_compact_fullscreen_exit_in_progress", False)):
-            return
-        fullscreen_active = False
-        zoomed_active = False
-        try:
-            fullscreen_active = bool(self.attributes("-fullscreen"))
-        except Exception:
-            fullscreen_active = False
-        try:
-            zoomed_active = (str(self.state()).lower() == "zoomed")
-        except Exception:
-            zoomed_active = False
-        if (not fullscreen_active) and (not zoomed_active):
-            return
-        self._compact_fullscreen_exit_in_progress = True
-        # New behavior: fullscreen request in Small View switches app back to Large View.
-        try:
-            self._compact_view = False
-            try:
-                self.btn_toggle_view.configure(text="Kleine Ansicht")
-            except Exception:
-                pass
-            self._refresh_log_toggle_label()
-            self._sync_main_layout()
-            self._restore_full_window_geometry()
-            self._apply_window_constraints_for_mode()
+            self.grid_columnconfigure(1, weight=1)
         except Exception:
             pass
         try:
-            self.after(250, lambda: setattr(self, "_compact_fullscreen_exit_in_progress", False))
-        except Exception:
-            self._compact_fullscreen_exit_in_progress = False
-
-    def _enforce_compact_width(self):
-        if not bool(getattr(self, "_compact_view", False)):
-            return
-        target_w = int(getattr(self, "_compact_fixed_width", 0) or 0)
-        if target_w <= 0 or bool(getattr(self, "_enforcing_compact_window", False)):
-            return
-        g = self._current_window_geometry()
-        if g is None:
-            return
-        w, h, x, y = g
-        if abs(int(w) - target_w) <= 1:
-            return
-        self._enforcing_compact_window = True
-        try:
-            self._set_window_geometry(target_w, h, x, y)
-        finally:
-            self._enforcing_compact_window = False
-
-    def _apply_window_constraints_for_mode(self):
-        compact = bool(getattr(self, "_compact_view", False))
-        if compact:
-            target_w = int(self._compact_target_width(log_visible=(not self._log_collapsed)))
-            self._compact_fixed_width = target_w
-            try:
-                self.resizable(False, True)
-            except Exception:
-                pass
-            try:
-                min_h = max(320, int(self.winfo_reqheight() or 320))
-                self.minsize(target_w, min_h)
-            except Exception:
-                pass
-            try:
-                max_h = 10_000
-                if isinstance(self._normal_window_maxsize, tuple) and len(self._normal_window_maxsize) == 2:
-                    max_h = max(int(self._normal_window_maxsize[1]), 320)
-                self.maxsize(target_w, max_h)
-            except Exception:
-                pass
-            self._force_exit_fullscreen_if_compact()
-            self._enforce_compact_width()
-            return
-
-        self._compact_fixed_width = None
-        try:
-            rw, rh = self._normal_window_resizable if isinstance(self._normal_window_resizable, tuple) else (True, True)
-            self.resizable(bool(rw), bool(rh))
+            self.content_root.grid(row=0, column=1, sticky="nsew", pady=0)
         except Exception:
             pass
-        try:
-            mw, mh = self._normal_window_minsize if isinstance(self._normal_window_minsize, tuple) else (1, 1)
-            self.minsize(int(mw), int(mh))
-        except Exception:
-            pass
-        try:
-            xw, xh = self._normal_window_maxsize if isinstance(self._normal_window_maxsize, tuple) else (10_000, 10_000)
-            self.maxsize(int(xw), int(xh))
-        except Exception:
-            pass
-
-    def _on_window_configure(self, _event=None):
-        if not bool(getattr(self, "_compact_view", False)):
-            return
-        self._force_exit_fullscreen_if_compact()
-        self._enforce_compact_width()
-
-    def _compact_target_width(self, log_visible: bool) -> int:
-        sidebar_w = int(getattr(self, "_sidebar_width", 230) or 230)
-        if not log_visible:
-            return sidebar_w
-        log_w = int(self._log_last_width if self._log_last_width else 400)
-        return sidebar_w + log_w + 16
-
-    def _apply_compact_window_size(self, log_visible: bool):
-        g = self._current_window_geometry()
-        if g is None:
-            return
-        _w, h, x, y = g
-        target_w = self._compact_target_width(log_visible=bool(log_visible))
-        self._compact_fixed_width = int(target_w)
-        self._set_window_geometry(target_w, h, x, y)
-
-    def _restore_full_window_geometry(self):
-        g = getattr(self, "_full_geometry_before_compact", None)
-        if g is not None:
-            w, h, x, y = g
-            self._set_window_geometry(w, h, x, y)
-        self._full_geometry_before_compact = None
 
     def _ensure_log_width(self):
-        if self._log_collapsed:
-            return
-        # In compact mode (log-only pane), let window resizing directly resize log.
-        try:
-            if bool(getattr(self, "_compact_view", False)) and self._pane_has(self.log_root) and (not self._pane_has(self.content_root)):
-                w = int(self.log_root.winfo_width() or 0)
-                if w > 0:
-                    self._log_last_width = w
-                return
-        except Exception:
-            pass
-        try:
-            w = self._log_last_width if self._log_last_width else 400
-            self.main_pane.paneconfigure(self.log_root, minsize=240, width=w)
-        except Exception:
-            pass
+        return
 
     def _log_line(self, text: str):
         try:
@@ -2955,7 +2857,7 @@ class TscribaRecorderApp(ctk.CTk):
             if not ok:
                 try:
                     self._log_line(f"[debug] Core Audio taps blocked: {reason}")
-                    self.status_var.set(reason)
+                    self.on_status(reason)
                     messagebox.showerror("Core Audio taps", reason)
                 except Exception:
                     pass
@@ -3028,7 +2930,7 @@ class TscribaRecorderApp(ctk.CTk):
         self._safe_set_state(self.live_transcription_chk, "disabled", "live_transcription_chk")
         self.mic_cb.configure(state="disabled")
         self.sys_cb.configure(state="disabled")
-        self.status_var.set("Input-Test läuft (ohne WAV-Aufnahme).")
+        self.on_status("Input-Test läuft (ohne WAV-Aufnahme).")
         self._set_levels_visible(True)
         self._update_level_states(recording_active=True)
         self._sync_record_buttons()
@@ -3062,7 +2964,7 @@ class TscribaRecorderApp(ctk.CTk):
             pass
         self._safe_set_state(self.rec_mic_chk, "normal", "rec_mic_chk")
         self._safe_set_state(self.rec_sys_chk, "normal", "rec_sys_chk")
-        self.status_var.set("Input-Test beendet.")
+        self.on_status("Input-Test beendet.")
         self.on_mode_change()
         self._set_levels_visible(False)
         self._update_level_states(recording_active=False)
@@ -3092,7 +2994,7 @@ class TscribaRecorderApp(ctk.CTk):
             if not ok:
                 try:
                     self._log_line(f"[debug] Core Audio taps blocked: {reason}")
-                    self.status_var.set(reason)
+                    self.on_status(reason)
                     messagebox.showerror("Core Audio taps", reason)
                 except Exception:
                     pass
@@ -3190,7 +3092,7 @@ class TscribaRecorderApp(ctk.CTk):
         else:
             # System-only recording running
             self._sys_only_running = True
-            self.status_var.set(f"Recording system audio → {sys_out_path}")
+            self.on_status(f"Recording system audio → {sys_out_path}")
 
         # Start live transcription (Mic + System) if enabled
         if bool(self.live_transcription_var.get()):
@@ -3236,16 +3138,6 @@ class TscribaRecorderApp(ctk.CTk):
         self._set_levels_visible(True)
         self._update_level_states(recording_active=True)
         self._apply_mic_gain_db(self._mic_gain_db_base)
-        if bool(self.auto_small_on_recording_var.get()) and (not bool(getattr(self, "_compact_view", False))):
-            self._full_geometry_before_compact = self._current_window_geometry()
-            self._compact_view = True
-            try:
-                self.btn_toggle_view.configure(text="Große Anzeige")
-            except Exception:
-                pass
-            self._sync_main_layout()
-            self._apply_compact_window_size(log_visible=(not self._log_collapsed))
-            self._apply_window_constraints_for_mode()
 
     def toggle_pause(self):
         # Pause/Resume is currently only implemented for mic recording.
@@ -3360,11 +3252,11 @@ class TscribaRecorderApp(ctk.CTk):
                     pass
 
             if getattr(self, "_last_sys_enabled", False) and not getattr(self, "_last_mic_enabled", False):
-                self.status_var.set(f"Saved system audio to: {sys_path}")
+                self.on_status(f"Saved system audio to: {sys_path}")
             elif getattr(self, "_last_sys_enabled", False) and getattr(self, "_last_mic_enabled", False):
-                self.status_var.set(f"Saved mic+system audio to: {mic_path}  and  {sys_path}  (combined: {os.path.join(session_dir, 'combined.wav')})")
+                self.on_status(f"Saved mic+system audio to: {mic_path}  and  {sys_path}  (combined: {os.path.join(session_dir, 'combined.wav')})")
             elif getattr(self, "_last_mic_enabled", False) and not getattr(self, "_last_sys_enabled", False):
-                self.status_var.set(f"Saved microphone audio to: {mic_path}")
+                self.on_status(f"Saved microphone audio to: {mic_path}")
         except Exception:
             pass
 
@@ -3477,7 +3369,6 @@ class TscribaRecorderApp(ctk.CTk):
 
     def on_status(self, text: str):
         def _set():
-            self.status_var.set(text)
             try:
                 self._log_line(text)
             except Exception:
@@ -3521,14 +3412,6 @@ class TscribaRecorderApp(ctk.CTk):
             pass
         try:
             self.level_sys.set(sys_val / 100.0)
-        except Exception:
-            pass
-        try:
-            self.level_mic_compact.set(mic_val / 100.0)
-        except Exception:
-            pass
-        try:
-            self.level_sys_compact.set(sys_val / 100.0)
         except Exception:
             pass
 
@@ -3626,7 +3509,7 @@ class TscribaRecorderApp(ctk.CTk):
             pass
 
     def tray_record(self):
-        if self.rec.is_running:
+        if self._is_recording_or_paused():
             self.show_window()
             return
         self.start_recording()
@@ -3637,7 +3520,7 @@ class TscribaRecorderApp(ctk.CTk):
         self.toggle_pause()
 
     def tray_stop(self):
-        if not self.rec.is_running:
+        if not self._is_recording_or_paused():
             return
         self.stop_recording()
 
@@ -3770,7 +3653,6 @@ class TscribaRecorderApp(ctk.CTk):
         if (not live_tab_enabled) and getattr(self, "_current_tab", "") == "Live Transcript":
             self._select_tab("Recorder")
         self._set_transcription_settings_enabled(live_tab_enabled)
-        self._update_compact_transcript_visibility()
         self._update_transcript_status()
         # If recording is already running, start/stop transcription immediately
         try:
@@ -3881,16 +3763,6 @@ class TscribaRecorderApp(ctk.CTk):
                     self._transcript_text.configure(state="disabled")
                 except Exception:
                     pass
-            compact_txt = getattr(self, "_compact_transcript_text", None)
-            if compact_txt is not None:
-                try:
-                    compact_txt.configure(state="normal")
-                    compact_txt.insert("end", text_line)
-                    compact_txt.see("end")
-                    compact_txt.configure(state="disabled")
-                except Exception:
-                    pass
-
         # Tk-safe
         try:
             self.after(0, _do)
@@ -3923,7 +3795,7 @@ class TscribaRecorderApp(ctk.CTk):
 
         def status_cb(msg: str):
             try:
-                self.after(0, lambda: self.status_var.set(msg))
+                self.after(0, lambda: self.on_status(msg))
             except Exception:
                 pass
             # Log status messages instead of transcript
@@ -4002,7 +3874,7 @@ class TscribaRecorderApp(ctk.CTk):
 
         def status_cb(msg: str):
             try:
-                self.after(0, lambda: self.status_var.set(msg))
+                self.after(0, lambda: self.on_status(msg))
             except Exception:
                 pass
             try:
@@ -4114,7 +3986,7 @@ class TscribaRecorderApp(ctk.CTk):
                 f.write(content)
 
             try:
-                self.status_var.set(f"Transcript gespeichert: {os.path.basename(out_path)}")
+                self.on_status(f"Transcript gespeichert: {os.path.basename(out_path)}")
             except Exception:
                 pass
         except Exception as e:
@@ -4163,7 +4035,7 @@ class TscribaRecorderApp(ctk.CTk):
         except Exception:
             return
         try:
-            self.after(0, lambda: self.main_pane.configure(bg=_resolve_color(BG_MAIN)))
+            self.after(0, lambda: self.content_root.configure(fg_color=BG_MAIN))
         except Exception:
             pass
         try:
@@ -4307,8 +4179,32 @@ class TscribaRecorderApp(ctk.CTk):
             pass
 
     def _on_auto_duck_toggle(self):
+        enabled = bool(self.auto_duck_var.get())
+        self._set_auto_duck_preset_enabled(enabled)
         if not self.auto_duck_var.get():
             self._apply_mic_gain_db(self._mic_gain_db_base)
+
+    def _set_auto_duck_preset_enabled(self, enabled: bool):
+        menu = getattr(self, "auto_duck_preset", None)
+        if menu is None:
+            return
+        try:
+            menu.configure(state=("normal" if enabled else "disabled"))
+        except Exception:
+            pass
+        try:
+            if enabled:
+                menu.configure(
+                    fg_color="#ffffff",
+                    border_color=_resolve_color(ENTRY_BORDER),
+                )
+            else:
+                menu.configure(
+                    fg_color=_resolve_color(READONLY_BG),
+                    border_color=_resolve_color(ENTRY_BORDER),
+                )
+        except Exception:
+            pass
 
     def _on_auto_duck_preset(self, value: str):
         try:
@@ -4347,6 +4243,8 @@ class TscribaRecorderApp(ctk.CTk):
         try:
             self._spin_set_state(self.silence_threshold_spin, "normal" if enabled else "disabled")
             self._spin_set_state(self.silence_duration_spin, "normal" if enabled else "disabled")
+            self._spin_set_visual_state(self.silence_threshold_spin, enabled, enabled_entry_bg="#ffffff")
+            self._spin_set_visual_state(self.silence_duration_spin, enabled, enabled_entry_bg="#ffffff")
         except Exception:
             pass
         if not enabled:
@@ -4412,7 +4310,7 @@ class TscribaRecorderApp(ctk.CTk):
             self._log_line(
                 f"Auto-stop triggered: silence for {silence_duration:.1f}s at <= {threshold_db:.1f} dBFS on active inputs."
             )
-            self.status_var.set("Auto-stop: keine Audiosignale erkannt.")
+            self.on_status("Auto-stop: keine Audiosignale erkannt.")
         except Exception:
             pass
         try:

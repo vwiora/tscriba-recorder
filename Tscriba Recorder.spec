@@ -1,9 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 from PyInstaller.utils.hooks import collect_dynamic_libs
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 
 datas = [('transcriba_theme.json', '.'), ('assets', 'assets')]
+if os.path.exists("release_manifest.json"):
+    datas.append(("release_manifest.json", "."))
 binaries = []
 hiddenimports = ['pystray._darwin']
 binaries += collect_dynamic_libs('ctranslate2')

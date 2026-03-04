@@ -99,6 +99,14 @@ else
   echo "webrtc-audio-processing unavailable; building without AEC module support."
 fi
 
+EXTRA_PYINSTALLER_ARGS=()
+if [[ -f "release_manifest.json" ]]; then
+  echo "Including release_manifest.json..."
+  EXTRA_PYINSTALLER_ARGS+=(--add-data "release_manifest.json:.")
+else
+  echo "release_manifest.json not found; build will rely on TRANSCRIBA_APP_VERSION override."
+fi
+
 pyinstaller \
   --clean \
   --noconfirm \
@@ -108,6 +116,7 @@ pyinstaller \
   --osx-bundle-identifier "$BUNDLE_ID" \
   --add-data "transcriba_theme.json:." \
   --add-data "assets:assets" \
+  ${EXTRA_PYINSTALLER_ARGS[@]+"${EXTRA_PYINSTALLER_ARGS[@]}"} \
   --collect-binaries ctranslate2 \
   --collect-binaries tokenizers \
   --collect-submodules ctranslate2 \
