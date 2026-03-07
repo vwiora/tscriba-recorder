@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+import sys
 from PyInstaller.utils.hooks import collect_dynamic_libs
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
@@ -8,16 +9,18 @@ datas = [('transcriba_theme.json', '.'), ('assets', 'assets')]
 if os.path.exists("release_manifest.json"):
     datas.append(("release_manifest.json", "."))
 binaries = []
-hiddenimports = ['pystray._darwin']
+hiddenimports = []
 binaries += collect_dynamic_libs('ctranslate2')
 binaries += collect_dynamic_libs('tokenizers')
 hiddenimports += collect_submodules('ctranslate2')
 hiddenimports += collect_submodules('tokenizers')
 hiddenimports += collect_submodules('pystray')
 hiddenimports += collect_submodules('PIL')
-hiddenimports += collect_submodules('objc')
-hiddenimports += collect_submodules('Foundation')
-hiddenimports += collect_submodules('AppKit')
+if sys.platform == 'darwin':
+    hiddenimports += ['pystray._darwin']
+    hiddenimports += collect_submodules('objc')
+    hiddenimports += collect_submodules('Foundation')
+    hiddenimports += collect_submodules('AppKit')
 tmp_ret = collect_all('faster_whisper')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('PIL')

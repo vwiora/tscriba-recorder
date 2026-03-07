@@ -85,6 +85,72 @@
       color: #ff9b9b;
       font-size: 0.9rem;
     }
+    .hint-panel {
+      margin-top: 14px;
+      border: 1px solid #304254;
+      border-radius: 10px;
+      padding: 10px;
+      background: #111b26;
+    }
+    .hint-title {
+      font-size: 0.9rem;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .hint-intent {
+      font-size: 1rem;
+      margin-bottom: 8px;
+    }
+    .hint-score {
+      color: var(--muted);
+      font-size: 0.86rem;
+      margin-bottom: 8px;
+    }
+    .hint-answer {
+      width: 100%;
+      min-height: 70px;
+      resize: vertical;
+      border-radius: 8px;
+      border: 1px solid #3b5066;
+      background: #0d1721;
+      color: var(--text);
+      padding: 8px;
+      font-family: Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 0.9rem;
+      line-height: 1.35;
+    }
+    .hint-actions {
+      margin-top: 8px;
+      display: flex;
+      justify-content: flex-end;
+    }
+    .btn-small {
+      min-width: 0;
+      padding: 8px 10px;
+      font-size: 0.8rem;
+      border-radius: 8px;
+      background: #41576e;
+    }
+    .debug-panel {
+      margin-top: 14px;
+      border: 1px dashed #3b5066;
+      border-radius: 10px;
+      padding: 10px;
+      background: #0d1721;
+    }
+    .debug-text {
+      width: 100%;
+      min-height: 80px;
+      resize: vertical;
+      border-radius: 8px;
+      border: 1px solid #3b5066;
+      background: #0a131b;
+      color: #cfe3f6;
+      padding: 8px;
+      font-family: Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 0.85rem;
+      line-height: 1.3;
+    }
   </style>
 </head>
 <body>
@@ -100,6 +166,34 @@
       <div class="kv">Helper API:</div>
       <div class="mono kv" id="apiTxt">http://127.0.0.1:8765</div>
     </div>
+
+    <section class="hint-panel">
+      <div class="hint-title">Objection helper</div>
+      <div class="hint-score">Detector: <span class="mono" id="detectorTxt">-</span></div>
+      <div class="hint-intent">Erkannt: <span class="mono" id="intentTxt">-</span></div>
+      <div class="hint-score">Konfidenz: <span class="mono" id="scoreTxt">-</span></div>
+      <textarea id="suggestionTxt" class="hint-answer" readonly>Vorschlag erscheint hier.</textarea>
+      <div class="hint-actions">
+        <button id="resetObjectionBtn" class="btn-small" type="button">Reset Objection</button>
+      </div>
+    </section>
+    <section class="hint-panel">
+      <div class="hint-title">Tone of voice (experimental)</div>
+      <div class="hint-score">Detector: <span class="mono" id="toneStatusTxt">-</span></div>
+      <div class="hint-intent">Tone: <span class="mono" id="toneLabelTxt">-</span></div>
+      <div class="hint-score">Konfidenz: <span class="mono" id="toneScoreTxt">-</span></div>
+      <div class="hint-score">Tone scores (raw):</div>
+      <textarea id="toneScoresTxt" class="debug-text" readonly>No tone scores yet.</textarea>
+      <div class="hint-actions">
+        <button id="toneToggleBtn" class="btn-small" type="button">Tone ON</button>
+      </div>
+    </section>
+    <section class="debug-panel">
+      <div class="hint-title">ASR debug (temporary)</div>
+      <div class="hint-score">Last ASR update: <span class="mono" id="asrUpdateTxt">-</span></div>
+      <textarea id="asrTextTxt" class="debug-text" readonly>No ASR text yet.</textarea>
+    </section>
+
     <div id="errorTxt" class="error"></div>
   </main>
 
@@ -113,6 +207,18 @@
     const meter = document.getElementById("meter");
     const errorTxt = document.getElementById("errorTxt");
     const apiTxt = document.getElementById("apiTxt");
+    const intentTxt = document.getElementById("intentTxt");
+    const scoreTxt = document.getElementById("scoreTxt");
+    const suggestionTxt = document.getElementById("suggestionTxt");
+    const detectorTxt = document.getElementById("detectorTxt");
+    const resetObjectionBtn = document.getElementById("resetObjectionBtn");
+    const toneStatusTxt = document.getElementById("toneStatusTxt");
+    const toneLabelTxt = document.getElementById("toneLabelTxt");
+    const toneScoreTxt = document.getElementById("toneScoreTxt");
+    const toneScoresTxt = document.getElementById("toneScoresTxt");
+    const toneToggleBtn = document.getElementById("toneToggleBtn");
+    const asrUpdateTxt = document.getElementById("asrUpdateTxt");
+    const asrTextTxt = document.getElementById("asrTextTxt");
 
     apiTxt.textContent = API_BASE;
     let running = false;
@@ -131,6 +237,41 @@
       meter.style.width = `${dbToPercent(db).toFixed(1)}%`;
       toggleBtn.textContent = running ? "OFF" : "ON";
       toggleBtn.classList.toggle("on", running);
+      const intent = (state.lastIntent || "").trim();
+      const score = Number(state.lastIntentScore);
+      detectorTxt.textContent = (state.detectorStatus || "-").toString();
+      intentTxt.textContent = intent || "-";
+      scoreTxt.textContent = Number.isFinite(score) && score > 0 ? `${Math.round(score * 100)}%` : "-";
+      suggestionTxt.value = (state.lastSuggestion || "").trim() || "Vorschlag erscheint hier.";
+      const toneLabel = (state.toneLabel || "").trim();
+      const toneScore = Number(state.toneScore);
+      const toneScores = state.toneScores || {};
+      const toneEnabled = !!state.toneEnabled;
+      toneStatusTxt.textContent = (state.toneStatus || "-").toString();
+      toneLabelTxt.textContent = toneLabel || "-";
+      toneScoreTxt.textContent = Number.isFinite(toneScore) && toneScore > 0 ? `${Math.round(toneScore * 100)}%` : "-";
+      toneToggleBtn.textContent = toneEnabled ? "Tone OFF" : "Tone ON";
+      try {
+        const entries = Object.entries(toneScores);
+        if (entries.length === 0) {
+          toneScoresTxt.value = "No tone scores yet.";
+        } else {
+          entries.sort((a, b) => Number(b[1]) - Number(a[1]));
+          toneScoresTxt.value = entries
+            .map(([k, v]) => `${k}: ${(Number(v) * 100).toFixed(1)}%`)
+            .join("\n");
+        }
+      } catch (_) {
+        toneScoresTxt.value = "No tone scores yet.";
+      }
+      const lastText = (state.lastText || "").trim();
+      asrTextTxt.value = lastText || "No ASR text yet.";
+      const lastAt = Number(state.lastTextAt);
+      if (Number.isFinite(lastAt) && lastAt > 0) {
+        asrUpdateTxt.textContent = new Date(lastAt * 1000).toLocaleTimeString();
+      } else {
+        asrUpdateTxt.textContent = "-";
+      }
       errorTxt.textContent = state.error || "";
     }
 
@@ -180,6 +321,34 @@
         errorTxt.textContent = err.message;
       } finally {
         toggleBtn.disabled = false;
+      }
+    });
+
+    resetObjectionBtn.addEventListener("click", async () => {
+      try {
+        errorTxt.textContent = "";
+        resetObjectionBtn.disabled = true;
+        const state = await call("/reset_objection", "POST");
+        setUI(state);
+      } catch (err) {
+        errorTxt.textContent = err.message;
+      } finally {
+        resetObjectionBtn.disabled = false;
+      }
+    });
+
+    toneToggleBtn.addEventListener("click", async () => {
+      try {
+        errorTxt.textContent = "";
+        toneToggleBtn.disabled = true;
+        const toneEnabled = toneToggleBtn.textContent === "Tone OFF";
+        const path = toneEnabled ? "/tone_off" : "/tone_on";
+        const state = await call(path, "POST");
+        setUI(state);
+      } catch (err) {
+        errorTxt.textContent = err.message;
+      } finally {
+        toneToggleBtn.disabled = false;
       }
     });
 

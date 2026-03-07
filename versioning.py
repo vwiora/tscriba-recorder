@@ -2,6 +2,8 @@ import json
 import os
 import platform
 import re
+import ssl
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -9,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 APP_SLUG_AUDIO_RECORDER = "transcriba-audio-recorder"
-DEFAULT_PORTAL_BASE_URL = "https://portal.transcriba.ai"
+DEFAULT_PORTAL_BASE_URL = "https://licenses.transcriba.store"
 DEFAULT_TIMEOUT_SECONDS = 8.0
 
 
@@ -125,11 +127,31 @@ def resolve_version_from_manifest(
 
 
 def portal_base_url() -> str:
-    return (os.environ.get("TRANSCRIBA_PORTAL_BASE_URL") or DEFAULT_PORTAL_BASE_URL).rstrip("/")
+    raw = (os.environ.get("TRANSCRIBA_PORTAL_BASE_URL") or DEFAULT_PORTAL_BASE_URL).strip()
+    if not raw:
+        return DEFAULT_PORTAL_BASE_URL
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    parsed = urllib.parse.urlparse(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return DEFAULT_PORTAL_BASE_URL
+    if any(ch.isspace() for ch in parsed.netloc):
+        return DEFAULT_PORTAL_BASE_URL
+    return raw.rstrip("/")
 
 
 def fallback_download_url() -> str:
     return f"{portal_base_url()}/download"
+
+
+def _build_ssl_context() -> ssl.SSLContext:
+    # Keep verification enabled; prefer certifi bundle for frozen app builds.
+    try:
+        import certifi  # type: ignore
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 
 def check_for_update(
@@ -140,20 +162,28 @@ def check_for_update(
     base_url: Optional[str] = None,
 ) -> UpdateCheckResult:
     base = (base_url or portal_base_url()).rstrip("/")
+    parsed = urllib.parse.urlparse(base)
+    if not parsed.scheme or not parsed.netloc:
+        base = portal_base_url()
     params = urllib.parse.urlencode({"app_slug": app_slug, "os_slug": os_slug})
     url = f"{base}/api/releases/latest?{params}"
     req = urllib.request.Request(url, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=_build_ssl_context()),
+        )
+        with opener.open(req, timeout=timeout_seconds) as resp:
             body = resp.read().decode("utf-8")
         payload = json.loads(body)
     except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
         return UpdateCheckResult(
             current_version=normalize_version(current_version),
             latest_version=None,
             update_available=False,
             download_url=fallback_download_url(),
-            error=str(exc),
+            error=detail,
         )
 
     latest = normalize_version(str(payload.get("latest_version", "")).strip())

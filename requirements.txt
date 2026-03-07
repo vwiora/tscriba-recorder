@@ -6,6 +6,7 @@ faster-whisper==1.2.1
 ctranslate2
 pystray
 Pillow
-pyobjc-framework-Cocoa
+pyobjc-framework-Cocoa; platform_system == "Darwin"
 customtkinter
+certifi
 webrtc-audio-processing; platform_system != "Darwin" or platform_machine != "arm64"

@@ -1,1 +1,9 @@
 pyinstaller>=6,<7
+numpy
+faster-whisper
+rapidfuzz
+webrtcvad
+sentence-transformers
+# Optional tone-of-voice detector (enable with WEBCAPTURE_ENABLE_TONE=1)
+speechbrain
+requests

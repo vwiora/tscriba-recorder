@@ -21,7 +21,7 @@ Desktop app for microphone/system audio recording, optional live transcription, 
 - API endpoint:
 - `GET /api/releases/latest?app_slug=<slug>&os_slug=<macos|windows|linux>`
 - Default portal base URL:
-- `https://portal.transcriba.ai` (override via env var below)
+- `https://licenses.transcriba.store` (override via env var below)
 - UI actions:
 - `Nach Updates suchen`: manual check with dialogs
 - silent background check runs shortly after startup (no popup)

@@ -21,6 +21,9 @@ from system_audio_backend import (
     SYSTEM_AUDIO_BACKEND_SCK,
     SYSTEM_AUDIO_BACKEND_COREAUDIO,
     SYSTEM_AUDIO_BACKEND_LABELS,
+    default_system_audio_backend,
+    list_available_system_audio_backends,
+    system_audio_backend_support,
     normalize_system_audio_backend as _normalize_system_audio_backend,
     system_audio_permission_hint_message,
     system_audio_permission_denied_message,
@@ -988,7 +991,9 @@ class TscribaRecorderApp(ctk.CTk):
         self.transcription_model_size_var = tk.StringVar(value="small")
         self.appearance_mode = tk.StringVar(value="System")
         self.recordings_root_var = tk.StringVar(value=default_recordings_dir())
-        self.system_audio_backend_var = tk.StringVar(value=SYSTEM_AUDIO_BACKEND_LABELS[SYSTEM_AUDIO_BACKEND_SCK])
+        self.system_audio_backend_var = tk.StringVar(
+            value=SYSTEM_AUDIO_BACKEND_LABELS.get(default_system_audio_backend(), SYSTEM_AUDIO_BACKEND_LABELS[SYSTEM_AUDIO_BACKEND_SCK])
+        )
         self.auto_stop_on_silence_var = tk.BooleanVar(value=False)
         self.silence_threshold_db_var = tk.DoubleVar(value=-55.0)
         self.silence_duration_seconds_var = tk.DoubleVar(value=8.0)
@@ -1705,7 +1710,7 @@ class TscribaRecorderApp(ctk.CTk):
         self.sys_cb = ctk.CTkComboBox(
             r2_top,
             variable=self.system_audio_backend_var,
-            values=list(SYSTEM_AUDIO_BACKEND_LABELS.values()),
+            values=[],
             command=lambda _val: self.on_mode_change(),
             font=_font(FONT_BASE),
             height=CONTROL_HEIGHT,
@@ -2131,16 +2136,16 @@ class TscribaRecorderApp(ctk.CTk):
         r7e = ctk.CTkFrame(sec3, fg_color="transparent", corner_radius=0)
         r7e.pack(fill="x", padx=8, pady=(8, 8))
         ctk.CTkLabel(r7e, text="System Audio Backend", font=_font(FONT_BASE)).pack(anchor="w")
-        backend_menu = ctk.CTkComboBox(
+        self.backend_menu = ctk.CTkComboBox(
             r7e,
             variable=self.system_audio_backend_var,
-            values=list(SYSTEM_AUDIO_BACKEND_LABELS.values()),
+            values=[],
             font=_font(FONT_BASE),
             height=CONTROL_HEIGHT,
             command=lambda _v: self.on_mode_change(),
         )
-        _style_entry(backend_menu)
-        backend_menu.pack(fill="x", pady=(4, 0))
+        _style_entry(self.backend_menu)
+        self.backend_menu.pack(fill="x", pady=(4, 0))
 
         r7f = ctk.CTkFrame(sec3, fg_color="transparent", corner_radius=0)
         r7f.pack(fill="x", padx=8, pady=(8, 4))
@@ -2619,13 +2624,37 @@ class TscribaRecorderApp(ctk.CTk):
         self.mic_cb.configure(values=values)
         if self.mic_var.get() not in values and values:
             self.mic_var.set(values[0])
-        # Systemaudio backend selection.
+        self._refresh_system_audio_backends()
+
+        self.on_device_change()
+
+    def _refresh_system_audio_backends(self):
+        available = list_available_system_audio_backends()
+        support = system_audio_backend_support()
+        self._system_audio_support = support
+
+        # Keep at least one visible item for UX, even if none are currently supported.
+        if not available:
+            fallback = default_system_audio_backend()
+            values = [SYSTEM_AUDIO_BACKEND_LABELS.get(fallback, "System Audio")]
+        else:
+            values = [SYSTEM_AUDIO_BACKEND_LABELS.get(b, b) for b in available]
+
+        try:
+            self.sys_cb.configure(values=values)
+        except Exception:
+            pass
+        try:
+            self.backend_menu.configure(values=values)
+        except Exception:
+            pass
+
         current_backend = _normalize_system_audio_backend(self.system_audio_backend_var.get())
+        if current_backend not in available:
+            current_backend = available[0] if available else default_system_audio_backend()
         self.system_audio_backend_var.set(
             SYSTEM_AUDIO_BACKEND_LABELS.get(current_backend, SYSTEM_AUDIO_BACKEND_LABELS[SYSTEM_AUDIO_BACKEND_SCK])
         )
-
-        self.on_device_change()
 
     def _find_entry(self, label: str):
         for d in self.input_devices:
@@ -2648,10 +2677,13 @@ class TscribaRecorderApp(ctk.CTk):
     def _current_system_audio_backend(self) -> str:
         return _normalize_system_audio_backend(self.system_audio_backend_var.get())
 
-    def _coreaudio_backend_supported_here(self) -> tuple[bool, str]:
-        if platform.system() != "Darwin":
-            return False, "Core Audio taps ist nur auf macOS verfügbar."
-        if _bundle_root() is None:
+    def _system_audio_backend_supported_here(self) -> tuple[bool, str]:
+        backend = self._current_system_audio_backend()
+        support = getattr(self, "_system_audio_support", None) or system_audio_backend_support()
+        ok, reason = support.get(backend, (False, "Dieses Systemaudio-Backend wird hier nicht unterstützt."))
+        if not ok:
+            return False, reason
+        if backend == SYSTEM_AUDIO_BACKEND_COREAUDIO and platform.system() == "Darwin" and _bundle_root() is None:
             return (
                 False,
                 "Core Audio taps benötigt den Start aus der gebauten .app (dist/Transcriba Recorder.app), "
@@ -2705,6 +2737,7 @@ class TscribaRecorderApp(ctk.CTk):
 
         mic_enabled = bool(self.rec_mic_var.get())
         sys_enabled = bool(self.rec_sys_var.get())
+        sys_ok, sys_reason = self._system_audio_backend_supported_here()
 
         # Live transcript checkbox only if any source is enabled
         if mic_enabled or sys_enabled:
@@ -2725,7 +2758,7 @@ class TscribaRecorderApp(ctk.CTk):
         # Systemaudio: UI only (no device selection)
         # We enable/disable the dropdown + gain control to reflect the choice.
         self.sys_cb.configure(state="normal" if sys_enabled else "disabled")
-        self._spin_set_state(self.sys_gain_spin, "normal" if sys_enabled else "disabled")
+        self._spin_set_state(self.sys_gain_spin, "normal" if sys_enabled and sys_ok else "disabled")
 
         # Channels behavior: if both sources selected, force 2ch mixdown mode in UI (like before)
         if mode == "both":
@@ -2745,6 +2778,13 @@ class TscribaRecorderApp(ctk.CTk):
             except Exception:
                 pass
             self.hint_var.set("Bitte mindestens eine Quelle auswählen (Mikrofon und/oder Systemaudio).")
+        elif sys_enabled and (not sys_ok) and (not mic_enabled):
+            self.btn_record.configure(state="disabled")
+            try:
+                self.btn_test.configure(state="disabled")
+            except Exception:
+                pass
+            self.hint_var.set(sys_reason or "Systemaudio-Backend nicht verfügbar.")
         else:
             if (not self.rec.is_running) and (not self._test_running):
                 self.btn_record.configure(state="normal")
@@ -2852,13 +2892,13 @@ class TscribaRecorderApp(ctk.CTk):
             pass
         if (not mic_enabled) and (not sys_enabled):
             return
-        if sys_enabled and self._current_system_audio_backend() == SYSTEM_AUDIO_BACKEND_COREAUDIO:
-            ok, reason = self._coreaudio_backend_supported_here()
+        if sys_enabled:
+            ok, reason = self._system_audio_backend_supported_here()
             if not ok:
                 try:
-                    self._log_line(f"[debug] Core Audio taps blocked: {reason}")
+                    self._log_line(f"[debug] System audio backend blocked: {reason}")
                     self.on_status(reason)
-                    messagebox.showerror("Core Audio taps", reason)
+                    messagebox.showerror("Systemaudio Backend", reason)
                 except Exception:
                     pass
                 return
@@ -2989,13 +3029,13 @@ class TscribaRecorderApp(ctk.CTk):
             pass
         if (not mic_enabled) and (not sys_enabled):
             return
-        if sys_enabled and self._current_system_audio_backend() == SYSTEM_AUDIO_BACKEND_COREAUDIO:
-            ok, reason = self._coreaudio_backend_supported_here()
+        if sys_enabled:
+            ok, reason = self._system_audio_backend_supported_here()
             if not ok:
                 try:
-                    self._log_line(f"[debug] Core Audio taps blocked: {reason}")
+                    self._log_line(f"[debug] System audio backend blocked: {reason}")
                     self.on_status(reason)
-                    messagebox.showerror("Core Audio taps", reason)
+                    messagebox.showerror("Systemaudio Backend", reason)
                 except Exception:
                     pass
                 return

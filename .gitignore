@@ -4,3 +4,11 @@ __pycache__/
 build/
 dist/
 .venv/
+
+# Local packaging artifacts
+/webcapture.zip
+/webcapture_handoff.zip
+/Windows CMD.zip
+
+# Local ML/cache assets (downloaded at runtime)
+/webcapture/wav2vec2_checkpoints/
